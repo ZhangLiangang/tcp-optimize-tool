@@ -9,9 +9,8 @@ This script performs full TCP stack tuning for modern congestion control algorit
 ## 🚀 Quick Install (One-Liner)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ZhangLiangang/tcp-optimize-tool/main/tcp-optimize-all.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ZhangLiangang/tcp-optimize-tool/main/install.sh) apply --profile=auto
 
-bash <(curl -fsSL https://raw.githubusercontent.com/ZhangLiangang/tcp-optimize-tool/main/install.sh)
 
 ```
 
