@@ -1,74 +1,43 @@
-TCP Optimize All-in-One Script
+# tcp-optimize-tool
 
-A powerful, one-click TCP optimizer for VPS and server environments.
+开箱即用的 VPS 网络与 I/O 性能增强 脚本，支持一键安装、自检、诊断、自动修复与回滚。
+默认启用（若内核支持）：BBR/BBRv2、fq qdisc、合理的 sysctl 阈值、RPS/XPS、多核中断分流、limits & systemd 限额提升。
+提供 diagnose（安全）与 "diagnose aggressive"（进取）两种自动调优模式。
 
-This script performs full TCP stack tuning for modern congestion control algorithms like **BBR**, **FQ**, and improves Linux networking performance by modifying `sysctl`, `limits.conf`, and `systemd` settings. After optimization, it runs a live diagnostic and scoring report.
+【一键安装与运行（需要 root 或可使用 sudo 的账号）】
+curl 版本：
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZhangLiangang/tcp-optimize-tool/main/install.sh)"
 
----
+wget 版本：
+bash -c "$(wget -qO- https://raw.githubusercontent.com/ZhangLiangang/tcp-optimize-tool/main/install.sh)"
 
-## 🚀 Quick Install (One-Liner)
+默认动作是 apply（安装并应用优化 + 自检）。
+也可以在后面传子命令：apply / diagnose / "diagnose aggressive" / status / selftest / rollback / purge
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/ZhangLiangang/tcp-optimize-tool/main/install.sh | bash
+示例：
+# 仅安装并立即执行“安全诊断 + 自动修复”
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZhangLiangang/tcp-optimize-tool/main/install.sh)" -s -- diagnose
 
+# 进取诊断（可能关闭 GRO/GSO/TSO，自动持久化；可 rollback）
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZhangLiangang/tcp-optimize-tool/main/install.sh)" -s -- "diagnose aggressive"
 
+【手动安装（可选）】
+sudo curl -fsSL https://raw.githubusercontent.com/ZhangLiangang/tcp-optimize-tool/main/vps-ultimate-net.sh -o /usr/local/sbin/vps-ultimate-net.sh
+sudo chmod +x /usr/local/sbin/vps-ultimate-net.sh
+sudo /usr/local/sbin/vps-ultimate-net.sh apply
 
-```
+【常用命令】
+sudo /usr/local/sbin/vps-ultimate-net.sh status           # 查看状态
+sudo /usr/local/sbin/vps-ultimate-net.sh selftest         # 自检（失败退出码非 0）
+sudo /usr/local/sbin/vps-ultimate-net.sh diagnose         # 安全诊断 + 自动修复
+sudo /usr/local/sbin/vps-ultimate-net.sh "diagnose aggressive"  # 进取诊断 + 必要时关闭 offload
+sudo /usr/local/sbin/vps-ultimate-net.sh rollback         # 回滚所有改动
+sudo /usr/local/sbin/vps-ultimate-net.sh purge            # 回滚并删除备份
 
----
+【设计取舍】
+- 安全优先：不强改 MTU/防火墙；offload 仅在“进取模式 + 明显异常 + 驱动不在白名单”时才动。
+- 可回滚：rollback 会移除 sysctl/limits/systemd 单元与持久化 offload 服务。
+- 可验证：selftest 和 status 可随时验证生效情况。
 
-## 🔧 What it does:
-
-✅ Enables **BBR** congestion control  
-✅ Enables **FQ** (Fair Queueing) queuing discipline  
-✅ Writes best-practice **sysctl** tuning for TCP performance  
-✅ Enlarges system and per-process file descriptor limits  
-✅ Adds `pam_limits.so` to PAM config if missing  
-✅ Writes `DefaultLimitNOFILE=1048576` to `systemd` manager config  
-✅ Downloads and runs [`tcp-diagnose`](tcp-diagnose.sh) to generate a live report and score
-
----
-
-## 🧪 Example Output
-
-```
-🚀 自动 TCP 网络优化 + BBR 启用 + 参数检测 一键完成
-
-[+] 设置 sysctl 配置...
-[+] 配置文件句柄限制...
-[+] 下载体检脚本并执行...
-
-🧪 TCP Diagnose Tool - By cosloc.net
-
-▶️ TCP Parameters:
-  ✅ Congestion Control: bbr
-  ✅ Queuing Discipline: fq
-  ✅ tcp_rmem: 67108864
-  ✅ tcp_wmem: 67108864
-
-▶️ File Descriptors:
-  ✅ fs.file-max: 1048576
-  ✅ ulimit -n: 1048576
-
-▶️ Network Test:
-  ⏱️  time_connect: 0.064s
-  🚀  download_speed: 83 KB/s
-
-🏁 Score: 70 / 70
-✅ Grade: A+ - Fully optimized for high performance proxy usage!
-```
-
----
-
-## 📥 Recommended Use Cases
-
-- Before launching proxy/V2Ray/Xray/relay nodes
-- After provisioning a new VPS
-- Airport or middlebox optimization
-- Automated baseline network hardening
-
----
-
-## 📜 License
-
-MIT © 2024 liangang 
+【支持平台】
+- Debian/Ubuntu 系（systemd 环境）。其他系统大多也能跑，但未全面测试。
