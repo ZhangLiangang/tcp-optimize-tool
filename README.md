@@ -41,3 +41,20 @@ sudo /usr/local/sbin/vps-ultimate-net.sh purge            # 回滚并删除备�
 
 【支持平台】
 - Debian/Ubuntu 系（systemd 环境）。其他系统大多也能跑，但未全面测试。
+
+- 建议的执行顺序：
+# 1) 一键安装并应用
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZhangLiangang/tcp-optimize-tool/main/install.sh)"
+
+# 2) 重启一次（让 systemd 限额完全继承）
+sudo reboot
+
+# 3) 开机后做安全诊断（会自动修复安全项）
+sudo /usr/local/sbin/vps-ultimate-net.sh diagnose
+
+# 如需更激进的 NIC 优化（满足条件才会动 offload）
+sudo /usr/local/sbin/vps-ultimate-net.sh "diagnose aggressive"
+
+# 4) 查看当前状态
+sudo /usr/local/sbin/vps-ultimate-net.sh status
+
