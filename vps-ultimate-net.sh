@@ -39,28 +39,47 @@ detect_iface() {
   done
 }
 
-# ========== BBR 检测 ==========
+# ========== BBR 检测（最低要求：必须支持 BBR/BBR2） ==========
 support_bbr2=0
 support_bbr=0
+BBR_MIN_REQUIRED=1       # 你的要求：最低必须 BBR
+HAVE_BBR=0               # 实际检测到是否有 BBR/BBR2
+BBR_HARD_FAIL=0          # 若最终无 BBR，则在自检中给出硬错误
 
 detect_bbr() {
   local avail
 
   support_bbr2=0
   support_bbr=0
+  HAVE_BBR=0
+  BBR_HARD_FAIL=0
 
-  # 允许 sysctl 失败而不终止整个脚本
+  # 尝试加载 BBR 模块（有些内核是模块形式）
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe tcp_bbr  2>/dev/null || true
+    modprobe tcp_bbr2 2>/dev/null || true
+  fi
+
   if ! avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null); then
     warn "无法读取 net.ipv4.tcp_available_congestion_control，假定当前不可用 BBR，将使用 cubic。"
+    if (( BBR_MIN_REQUIRED == 1 )); then
+      BBR_HARD_FAIL=1
+    fi
     return
   fi
 
-  # 注意：必须用 if 包裹，不能单独 [[ ... ]]，避免在 set -e 下匹配失败导致整个脚本退出
   if [[ "$avail" =~ (^|[[:space:]])bbr2([[:space:]]|$) ]]; then
     support_bbr2=1
+    HAVE_BBR=1
   fi
   if [[ "$avail" =~ (^|[[:space:]])bbr([[:space:]]|$) ]]; then
     support_bbr=1
+    HAVE_BBR=1
+  fi
+
+  if (( BBR_MIN_REQUIRED == 1 && HAVE_BBR == 0 )); then
+    BBR_HARD_FAIL=1
+    warn "内核当前未提供 BBR/BBR2 拥塞控制算法，不满足最低要求。将暂时使用 cubic，但自检会标记为 FAIL。"
   fi
 }
 
@@ -84,12 +103,20 @@ ensure_packages() {
 
 write_sysctl() {
   detect_bbr
+
   local qdisc="fq"
   local cc="cubic"
-  if [[ $support_bbr2 -eq 1 ]]; then
-    cc="bbr2"
-  elif [[ $support_bbr -eq 1 ]]; then
-    cc="bbr"
+
+  # 优先级：bbr2 > bbr；若内核无 BBR，则仍用 cubic 但标记为硬错误
+  if (( HAVE_BBR == 1 )); then
+    if (( support_bbr2 == 1 )); then
+      cc="bbr2"
+    elif (( support_bbr == 1 )); then
+      cc="bbr"
+    fi
+  else
+    # 没有 BBR，只能安全使用 cubic，实际不满足你的“最低要求”
+    cc="cubic"
   fi
 
   cat >"$SYSCTL_FILE" <<EOF
@@ -184,7 +211,9 @@ apply_rps_for_iface() {
   local txq
   for txq in /sys/class/net/"$IFACE"/queues/tx-*; do
     [[ -e "$txq" ]] || continue
-    echo "$mask" > "$txq/xps_cpus" || true
+    if [[ -w "$txq/xps_cpus" ]]; then
+      echo "$mask" > "$txq/xps_cpus" || true
+    fi
   done
 }
 
@@ -328,6 +357,10 @@ check_ulimit_nofile() {
 selftest_all() {
   PASS_CNT=0
   FAIL_CNT=0
+
+  # 再次检测 BBR 状态，以确保自检逻辑与当前内核真实状态一致
+  detect_bbr
+
   echo "===== ${SCRIPT_NAME} 自检开始 ====="
   check_file_exists "$SYSCTL_FILE"
   check_file_exists "$LIMITS_FILE"
@@ -336,22 +369,29 @@ selftest_all() {
   check_file_exists "$RPS_SERVICE"
   check_service_enabled "$RPS_SERVICE"
 
-  local avail cc exp_cc
-  avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+  local cc exp_cc
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
 
-  if [[ "$avail" =~ (^|[[:space:]])bbr2([[:space:]]|$) ]]; then
-    exp_cc="bbr2"
-  elif [[ "$avail" =~ (^|[[:space:]])bbr([[:space:]]|$) ]]; then
-    exp_cc="bbr"
+  if (( HAVE_BBR == 1 )); then
+    if (( support_bbr2 == 1 )); then
+      exp_cc="bbr2"
+    elif (( support_bbr == 1 )); then
+      exp_cc="bbr"
+    else
+      exp_cc="bbr"
+    fi
   else
-    exp_cc="cubic"
+    # 最低要求是 BBR，因此期望值仍然是 BBR；实际不是就 FAIL
+    exp_cc="bbr"
   fi
 
-  # 这里只做“是否为推荐算法”的检查
+  # BBR 核心检查：必须是 bbr/bbr2，否则判定为不满足最低要求
   check_eq net.ipv4.tcp_congestion_control "$exp_cc"
-  check_eq net.core.default_qdisc "fq"
+  if (( BBR_HARD_FAIL == 1 || HAVE_BBR == 0 )); then
+    record 0 "内核未提供 BBR/BBR2（或无法启用），不满足最低要求，请更换内核或启用 tcp_bbr 模块。"
+  fi
 
+  check_eq net.core.default_qdisc "fq"
   check_ge net.core.rmem_max 134217728
   check_ge net.core.wmem_max 134217728
   check_ge net.core.netdev_max_backlog 250000
@@ -366,7 +406,7 @@ selftest_all() {
 
   echo "===== 自检结束：PASS=$PASS_CNT, FAIL=$FAIL_CNT ====="
   if (( FAIL_CNT > 0 )); then
-    warn "存在未通过项。若仅为 nofile，会在重启后自动继承 systemd 限额。"
+    warn "存在未通过项。若仅为 nofile，可重启后再次自检；若为 BBR 相关错误，则当前内核不满足你的最低要求。"
     return 1
   fi
   return 0
@@ -383,21 +423,24 @@ status_all() {
   sysctl vm.swappiness || true
 
   echo -e "\n===== RPS/XPS 检查 ====="
-  local dev
+  local dev rxq txq
   for dev in /sys/class/net/*; do
     dev=$(basename "$dev")
     [[ "$dev" == "lo" ]] && continue
     [[ "$dev" == docker* || "$dev" == veth* || "$dev" == br-* || "$dev" == "tailscale0" ]] && continue
     if [[ -d "/sys/class/net/$dev/queues" ]]; then
       echo ">> $dev"
-      local rxq txq
       for rxq in /sys/class/net/"$dev"/queues/rx-*; do
         [[ -e "$rxq" ]] || continue
         echo -n "  $(basename "$rxq") rps_cpus="; cat "$rxq/rps_cpus"
       done
       for txq in /sys/class/net/"$dev"/queues/tx-*; do
         [[ -e "$txq" ]] || continue
-        echo -n "  $(basename "$txq") xps_cpus="; cat "$txq/xps_cpus"
+        if [[ -f "$txq/xps_cpus" ]]; then
+          echo -n "  $(basename "$txq") xps_cpus="; cat "$txq/xps_cpus"
+        else
+          echo "  $(basename "$txq") xps_cpus=<不支持/不存在>"
+        fi
       done
     fi
   done
@@ -500,12 +543,15 @@ diagnose_core() {
   fi
 
   local avail EXP_CC
+  detect_bbr
   avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
-  EXP_CC="cubic"
-  if [[ "$avail" =~ (^|[[:space:]])bbr2([[:space:]]|$) ]]; then
-    EXP_CC="bbr2"
-  elif [[ "$avail" =~ (^|[[:space:]])bbr([[:space:]]|$) ]]; then
-    EXP_CC="bbr"
+  EXP_CC="bbr"
+  if (( HAVE_BBR == 1 )); then
+    if (( support_bbr2 == 1 )); then
+      EXP_CC="bbr2"
+    elif (( support_bbr == 1 )); then
+      EXP_CC="bbr"
+    fi
   fi
 
   if [[ "$CC" != "$EXP_CC" ]]; then
@@ -541,7 +587,7 @@ diagnose_core() {
 
   echo "===== 诊断建议汇总 ====="
   echo "- qdisc 建议：fq（已由脚本管理）"
-  echo "- 拥塞算法建议：$EXP_CC（已由脚本管理）"
+  echo "- 拥塞算法建议：$EXP_CC（已由脚本管理，且 BBR 为最低要求）"
   echo "- RPS/XPS：所有队列掩码非 0（脚本已自动纠正）"
   if (( AGGRESSIVE_SUGGEST == 1 )); then
     echo "- 进取建议：$REASON 建议关闭 ${IFACE} 的 GRO/GSO/TSO 并持久化。"
@@ -622,7 +668,15 @@ apply_all() {
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
   log "当前拥塞控制算法：${cc:-<未知>}"
   log "apply 完成。将自动执行自检..."
-  selftest_all || true
+  if selftest_all; then
+    log "自检通过。"
+  else
+    if (( BBR_HARD_FAIL == 1 || HAVE_BBR == 0 )); then
+      err "自检未通过：当前内核未满足最低要求 BBR/BBR2。请更换内核或启用 tcp_bbr 模块。"
+    else
+      warn "自检存在未通过项，详见上方输出。"
+    fi
+  fi
   log "建议重启以使 systemd 限额完全生效：reboot"
 }
 
@@ -630,15 +684,16 @@ usage() {
   cat <<EOF
 用法：$0 {apply|status|selftest|diagnose|diagnose aggressive|rollback|purge}
 
-  apply                 应用/更新优化（完成后自动自检）
+  apply                 应用/更新优化（完成后自动自检，要求至少 BBR）
   status                查看关键状态（sysctl/RPS/NOFILE）
-  selftest              手动运行自检（失败退出码非 0）
+  selftest              手动运行自检（若未满足 BBR 最低要求则退出码非 0）
   diagnose              诊断并输出建议，自动应用“安全修复”
   diagnose aggressive   诊断并应用“进取修复”（可能关闭 GRO/GSO/TSO），可回滚
   rollback              回滚本脚本写入的所有配置与服务
   purge                 回滚并删除备份目录
 
 备注：
+- 最低要求为 BBR/BBR2；若内核未提供，将在自检中明确 FAIL，并提醒更换内核或启用 tcp_bbr。
 - 自检若仅报 nofile，不影响网络性能；重启后新会话会继承提升的限额。
 - 进取模式仅在驱动非 virtio_net/ena/vmxnet3/mlx*/hv_netvsc 且 loopback 明显偏低时才会动 offload。
 EOF
