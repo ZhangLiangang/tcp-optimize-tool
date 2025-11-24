@@ -25,25 +25,43 @@ need_root() {
 
 detect_iface() {
   local cand
+  # 首选有 IPv4 地址、非 lo / 容器设备
   for cand in /sys/class/net/*; do
     cand=$(basename "$cand")
     [[ "$cand" == "lo" ]] && continue
     [[ "$cand" == docker* || "$cand" == veth* || "$cand" == br-* || "$cand" == "tailscale0" ]] && continue
     ip -o -4 addr show dev "$cand" | grep -q 'inet ' && { echo "$cand"; return; }
   done
+  # 退而求其次，选任意非 lo 设备
   for cand in /sys/class/net/*; do
     cand=$(basename "$cand")
     [[ "$cand" == "lo" ]] || { echo "$cand"; return; }
   done
 }
 
+# ========== BBR 检测 ==========
 support_bbr2=0
 support_bbr=0
+
 detect_bbr() {
   local avail
-  avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
-  [[ "$avail" =~ (^| )bbr2( |$) ]] && support_bbr2=1
-  [[ "$avail" =~ (^| )bbr( |$)  ]] && support_bbr=1
+
+  support_bbr2=0
+  support_bbr=0
+
+  # 允许 sysctl 失败而不终止整个脚本
+  if ! avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null); then
+    warn "无法读取 net.ipv4.tcp_available_congestion_control，假定当前不可用 BBR，将使用 cubic。"
+    return
+  fi
+
+  # 注意：必须用 if 包裹，不能单独 [[ ... ]]，避免在 set -e 下匹配失败导致整个脚本退出
+  if [[ "$avail" =~ (^|[[:space:]])bbr2([[:space:]]|$) ]]; then
+    support_bbr2=1
+  fi
+  if [[ "$avail" =~ (^|[[:space:]])bbr([[:space:]]|$) ]]; then
+    support_bbr=1
+  fi
 }
 
 backup_once() {
@@ -202,26 +220,8 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now "$(basename "$RPS_SERVICE")"
+  systemctl enable --now "$(basename "$RPS_SERVICE")" || true
   log "已安装并启用 RPS/XPS 开机服务：$(basename "$RPS_SERVICE")"
-}
-
-apply_all() {
-  need_root
-  ensure_packages
-  mkdir -p "$BACKUP_DIR"
-  backup_once
-  write_sysctl
-  write_limits
-  write_rps_script
-  write_rps_service
-
-  local cc
-  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
-  log "当前拥塞控制算法：$cc"
-  log "apply 完成。将自动执行自检..."
-  selftest_all || true
-  log "建议重启以使 systemd 限额完全生效：reboot"
 }
 
 # ========== 自检模块 ==========
@@ -231,9 +231,11 @@ FAIL_CNT=0
 record() {
   local ok="$1" msg="$2"
   if [[ "$ok" == "1" ]]; then
-    echo -e "✅  $msg"; PASS_CNT=$((PASS_CNT+1))
+    echo -e "✅  $msg"
+    PASS_CNT=$((PASS_CNT+1))
   else
-    echo -e "❌  $msg"; FAIL_CNT=$((FAIL_CNT+1))
+    echo -e "❌  $msg"
+    FAIL_CNT=$((FAIL_CNT+1))
   fi
 }
 
@@ -259,11 +261,16 @@ check_ge() { # key >= min
 
 check_file_exists() {
   local f="$1"
-  if [[ -f "$f" ]]; then record 1 "存在文件：$f"; else record 0 "缺少文件：$f"; fi
+  if [[ -f "$f" ]]; then
+    record 1 "存在文件：$f"
+  else
+    record 0 "缺少文件：$f"
+  fi
 }
 
 check_service_enabled() {
-  local svc="$(basename "$1")"
+  local svc
+  svc="$(basename "$1")"
   if systemctl is-enabled "$svc" &>/dev/null; then
     record 1 "systemd 服务已启用：$svc"
   else
@@ -277,25 +284,32 @@ check_service_enabled() {
 }
 
 check_rps_xps_nonzero() {
-  local ok=1 dev rxfile txfile v any
+  local dev rxfile txfile v any ok
   for dev in /sys/class/net/*; do
     dev=$(basename "$dev")
     [[ "$dev" == "lo" ]] && continue
     [[ "$dev" == docker* || "$dev" == veth* || "$dev" == br-* || "$dev" == "tailscale0" ]] && continue
     if [[ -d "/sys/class/net/$dev/queues" ]]; then
       any=0
+      ok=1
       for rxfile in /sys/class/net/"$dev"/queues/rx-*/rps_cpus; do
         [[ -f "$rxfile" ]] || continue
-        any=1; v=$(cat "$rxfile")
-        [[ "$v" != "0" && "$v" != "" ]] || ok=0
+        any=1
+        v=$(cat "$rxfile")
+        if [[ "$v" == "0" || -z "$v" ]]; then
+          ok=0
+        fi
       done
       for txfile in /sys/class/net/"$dev"/queues/tx-*/xps_cpus; do
         [[ -f "$txfile" ]] || continue
-        any=1; v=$(cat "$txfile")
-        [[ "$v" != "0" && "$v" != "" ]] || ok=0
+        any=1
+        v=$(cat "$txfile")
+        if [[ "$v" == "0" || -z "$v" ]]; then
+          ok=0
+        fi
       done
       if (( any == 1 )); then
-        record $(( ok )) "RPS/XPS 非零掩码：$dev"
+        record $ok "RPS/XPS 非零掩码：$dev"
       fi
     fi
   done
@@ -312,7 +326,8 @@ check_ulimit_nofile() {
 }
 
 selftest_all() {
-  PASS_CNT=0; FAIL_CNT=0
+  PASS_CNT=0
+  FAIL_CNT=0
   echo "===== ${SCRIPT_NAME} 自检开始 ====="
   check_file_exists "$SYSCTL_FILE"
   check_file_exists "$LIMITS_FILE"
@@ -321,12 +336,19 @@ selftest_all() {
   check_file_exists "$RPS_SERVICE"
   check_service_enabled "$RPS_SERVICE"
 
-  local cc exp_cc
-  cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
-  if [[ "$cc" =~ (^| )bbr2( |$) ]]; then exp_cc="bbr2"
-  elif [[ "$cc" =~ (^| )bbr( |$) ]]; then exp_cc="bbr"
-  else exp_cc="cubic"; fi
+  local avail cc exp_cc
+  avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
 
+  if [[ "$avail" =~ (^|[[:space:]])bbr2([[:space:]]|$) ]]; then
+    exp_cc="bbr2"
+  elif [[ "$avail" =~ (^|[[:space:]])bbr([[:space:]]|$) ]]; then
+    exp_cc="bbr"
+  else
+    exp_cc="cubic"
+  fi
+
+  # 这里只做“是否为推荐算法”的检查
   check_eq net.ipv4.tcp_congestion_control "$exp_cc"
   check_eq net.core.default_qdisc "fq"
 
@@ -344,7 +366,7 @@ selftest_all() {
 
   echo "===== 自检结束：PASS=$PASS_CNT, FAIL=$FAIL_CNT ====="
   if (( FAIL_CNT > 0 )); then
-    warn "存在未通过项。若仅为 nofile，会在重启后通过。"
+    warn "存在未通过项。若仅为 nofile，会在重启后自动继承 systemd 限额。"
     return 1
   fi
   return 0
@@ -361,12 +383,14 @@ status_all() {
   sysctl vm.swappiness || true
 
   echo -e "\n===== RPS/XPS 检查 ====="
+  local dev
   for dev in /sys/class/net/*; do
     dev=$(basename "$dev")
     [[ "$dev" == "lo" ]] && continue
     [[ "$dev" == docker* || "$dev" == veth* || "$dev" == br-* || "$dev" == "tailscale0" ]] && continue
     if [[ -d "/sys/class/net/$dev/queues" ]]; then
       echo ">> $dev"
+      local rxq txq
       for rxq in /sys/class/net/"$dev"/queues/rx-*; do
         [[ -e "$rxq" ]] || continue
         echo -n "  $(basename "$rxq") rps_cpus="; cat "$rxq/rps_cpus"
@@ -384,13 +408,23 @@ status_all() {
 
 # ========== 诊断与自动调优 ==========
 iface_driver() {
-  local IF="$(detect_iface)"; [[ -z "${IF:-}" ]] && IF="eth0"
-  ethtool -i "$IF" 2>/dev/null | awk -F': ' '/driver:/{print $2; exit}' || echo "unknown"
+  local IF
+  IF="$(detect_iface)"
+  [[ -z "${IF:-}" ]] && IF="eth0"
+  if command -v ethtool >/dev/null 2>&1; then
+    ethtool -i "$IF" 2>/dev/null | awk -F': ' '/driver:/{print $2; exit}' || echo "unknown"
+  else
+    echo "unknown"
+  fi
 }
+
 iface_name() {
-  local IF="$(detect_iface)"; [[ -z "${IF:-}" ]] && IF="eth0"
+  local IF
+  IF="$(detect_iface)"
+  [[ -z "${IF:-}" ]] && IF="eth0"
   echo "$IF"
 }
+
 driver_in_safe_offload_list() {
   local d="$1"
   [[ "$d" == virtio_net || "$d" == ena || "$d" == vmxnet3 || "$d" == hv_netvsc || "$d" == mlx* ]]
@@ -426,7 +460,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now "$(basename "$ETHTOOL_SERVICE")"
+  systemctl enable --now "$(basename "$ETHTOOL_SERVICE")" || true
   log "已持久化关闭 ${IF} 的 GRO/GSO/TSO：$(basename "$ETHTOOL_SERVICE")"
 }
 
@@ -442,12 +476,13 @@ diagnose_core() {
   ensure_packages
 
   echo "===== ${SCRIPT_NAME} 诊断开始 ====="
-  local KERN="$(uname -r)"
-  local CPUS="$(nproc)"
-  local IFACE="$(iface_name)"
-  local DRV="$(iface_driver)"
-  local QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")"
-  local CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")"
+  local KERN CPUS IFACE DRV QDISC CC
+  KERN="$(uname -r)"
+  CPUS="$(nproc)"
+  IFACE="$(iface_name)"
+  DRV="$(iface_driver)"
+  QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")"
+  CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")"
 
   echo "内核：$KERN"
   echo "CPU 核心：$CPUS"
@@ -464,16 +499,21 @@ diagnose_core() {
     NEED_FIX=1
   fi
 
-  local avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
-  local EXP_CC="cubic"
-  [[ "$avail" =~ (^| )bbr2( |$) ]] && EXP_CC="bbr2"
-  [[ "$avail" =~ (^| )bbr( |$)  && "$EXP_CC" != "bbr2" ]] && EXP_CC="bbr"
+  local avail EXP_CC
+  avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+  EXP_CC="cubic"
+  if [[ "$avail" =~ (^|[[:space:]])bbr2([[:space:]]|$) ]]; then
+    EXP_CC="bbr2"
+  elif [[ "$avail" =~ (^|[[:space:]])bbr([[:space:]]|$) ]]; then
+    EXP_CC="bbr"
+  fi
+
   if [[ "$CC" != "$EXP_CC" ]]; then
     echo "建议：将拥塞控制设置为 $EXP_CC（当前 $CC）。已在配置中指定，将立即修正。"
     NEED_FIX=1
   fi
 
-  local ANY_ZERO=0
+  local ANY_ZERO=0 f
   for f in /sys/class/net/"$IFACE"/queues/rx-*/rps_cpus /sys/class/net/"$IFACE"/queues/tx-*/xps_cpus; do
     [[ -f "$f" ]] || continue
     [[ "$(cat "$f")" == "0" ]] && ANY_ZERO=1
@@ -523,8 +563,9 @@ diagnose_aggressive() {
   local out
   out="$(diagnose_core)"
   echo "$out"
-  local IFACE="$(iface_name)"
-  local flag=$(echo "$out" | awk -F'=' '/AGGRESSIVE_SUGGEST=/{print $2; exit}')
+  local IFACE flag
+  IFACE="$(iface_name)"
+  flag=$(echo "$out" | awk -F'=' '/AGGRESSIVE_SUGGEST=/{print $2; exit}')
   if [[ "$flag" == "1" ]]; then
     if command -v ethtool >/dev/null 2>&1; then
       /sbin/ethtool -K "$IFACE" gro off gso off tso off || true
@@ -567,6 +608,24 @@ purge_all() {
   log "已清理备份目录：$BACKUP_DIR"
 }
 
+apply_all() {
+  need_root
+  ensure_packages
+  mkdir -p "$BACKUP_DIR"
+  backup_once
+  write_sysctl
+  write_limits
+  write_rps_script
+  write_rps_service
+
+  local cc
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+  log "当前拥塞控制算法：${cc:-<未知>}"
+  log "apply 完成。将自动执行自检..."
+  selftest_all || true
+  log "建议重启以使 systemd 限额完全生效：reboot"
+}
+
 usage() {
   cat <<EOF
 用法：$0 {apply|status|selftest|diagnose|diagnose aggressive|rollback|purge}
@@ -586,12 +645,12 @@ EOF
 }
 
 case "${1:-}" in
-  apply)                apply_all ;;
-  status)               status_all ;;
-  selftest)             selftest_all ;;
-  diagnose)             diagnose_safe ;;
-  "diagnose aggressive")diagnose_aggressive ;;
-  rollback)             rollback_all ;;
-  purge)                purge_all ;;
-  *) usage; exit 1 ;;
+  apply)                  apply_all ;;
+  status)                 status_all ;;
+  selftest)               selftest_all ;;
+  diagnose)               diagnose_safe ;;
+  "diagnose aggressive")  diagnose_aggressive ;;
+  rollback)               rollback_all ;;
+  purge)                  purge_all ;;
+  *)                      usage; exit 1 ;;
 esac
