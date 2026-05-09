@@ -1,0 +1,147 @@
+bash <<'BASH'
+set -e
+
+CONF="/etc/sysctl.d/99-vps-net.conf"
+BACKUP_DIR="/root/sysctl-backup-$(date +%F-%H%M%S)"
+
+echo "===== 1. 检查是否为 root ====="
+if [ "$(id -u)" -ne 0 ]; then
+    echo "错误：请使用 root 执行。"
+    echo "可以先运行：sudo -i"
+    exit 1
+fi
+
+echo
+echo "===== 2. 检查 BBR 支持 ====="
+modprobe tcp_bbr 2>/dev/null || true
+
+AVAILABLE_CC="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+
+echo "当前可用 TCP 拥塞算法：$AVAILABLE_CC"
+
+if echo "$AVAILABLE_CC" | grep -qw "bbr"; then
+    echo "检测结果：支持 BBR，可以继续。"
+else
+    echo "错误：当前 VPS 内核不支持 BBR。"
+    echo "不会继续修改配置。"
+    echo
+    echo "当前内核："
+    uname -r
+    echo
+    echo "建议：更换 Debian 11/12、Ubuntu 20.04+、Ubuntu 22.04+、Ubuntu 24.04+，或升级内核。"
+    exit 1
+fi
+
+echo
+echo "===== 3. 创建备份目录 ====="
+mkdir -p "$BACKUP_DIR"
+
+echo "===== 4. 备份 sysctl 配置 ====="
+cp -a /etc/sysctl.conf "$BACKUP_DIR/sysctl.conf.bak" 2>/dev/null || true
+cp -a /etc/sysctl.d "$BACKUP_DIR/sysctl.d.bak" 2>/dev/null || true
+
+echo "备份位置：$BACKUP_DIR"
+
+echo
+echo "===== 5. 注释旧配置中的冲突参数 ====="
+
+KEYS='net.core.default_qdisc|net.ipv4.tcp_congestion_control|net.core.somaxconn|net.core.netdev_max_backlog|net.core.rmem_max|net.core.wmem_max|net.core.rmem_default|net.core.wmem_default|net.ipv4.tcp_fastopen|net.ipv4.tcp_mtu_probing|net.ipv4.tcp_slow_start_after_idle|net.ipv4.tcp_keepalive_time|net.ipv4.tcp_keepalive_intvl|net.ipv4.tcp_keepalive_probes|net.ipv4.ip_local_port_range'
+
+for f in /etc/sysctl.conf /etc/sysctl.d/*.conf; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$CONF" ] && continue
+
+    sed -i.bak -E "/^[[:space:]]*(${KEYS})[[:space:]]*=/s/^/# disabled by 99-vps-net: /" "$f"
+done
+
+echo
+echo "===== 6. 写入新的网络优化配置 ====="
+
+cat > "$CONF" <<'EOF'
+# VPS network optimization
+
+# BBR
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+
+# Queue
+net.core.somaxconn=65535
+net.core.netdev_max_backlog=250000
+
+# Buffer
+net.core.rmem_max=134217728
+net.core.wmem_max=134217728
+net.core.rmem_default=4194304
+net.core.wmem_default=4194304
+
+# TCP
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
+
+# Keepalive
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=5
+
+# Port
+net.ipv4.ip_local_port_range=10240 65535
+EOF
+
+echo
+echo "===== 7. 应用 sysctl 配置 ====="
+sysctl --system >/dev/null || true
+
+echo
+echo "===== 8. 强制加载目标配置 ====="
+sysctl -p "$CONF"
+
+echo
+echo "===== 9. 最终检查结果 ====="
+
+echo
+echo "===== BBR / QDISC ====="
+sysctl net.core.default_qdisc
+sysctl net.ipv4.tcp_congestion_control
+sysctl net.ipv4.tcp_available_congestion_control
+
+echo
+echo "===== Queue ====="
+sysctl net.core.somaxconn
+sysctl net.core.netdev_max_backlog
+
+echo
+echo "===== Buffer ====="
+sysctl net.core.rmem_max
+sysctl net.core.wmem_max
+sysctl net.core.rmem_default
+sysctl net.core.wmem_default
+
+echo
+echo "===== TCP ====="
+sysctl net.ipv4.tcp_fastopen
+sysctl net.ipv4.tcp_mtu_probing
+sysctl net.ipv4.tcp_slow_start_after_idle
+
+echo
+echo "===== Keepalive ====="
+sysctl net.ipv4.tcp_keepalive_time
+sysctl net.ipv4.tcp_keepalive_intvl
+sysctl net.ipv4.tcp_keepalive_probes
+
+echo
+echo "===== Port Range ====="
+sysctl net.ipv4.ip_local_port_range
+
+echo
+echo "===== 10. 检查是否还有重复冲突项 ====="
+grep -R "net.core.somaxconn\|net.core.default_qdisc\|net.ipv4.tcp_congestion_control\|net.core.netdev_max_backlog\|net.core.rmem_max\|net.core.wmem_max\|net.ipv4.ip_local_port_range" /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null || true
+
+echo
+echo "===== 完成 ====="
+echo "重点确认下面几项："
+echo "net.core.default_qdisc 应为 fq"
+echo "net.ipv4.tcp_congestion_control 应为 bbr"
+echo "net.core.somaxconn 应为 65535"
+echo "net.core.netdev_max_backlog 应为 250000"
+BASH
