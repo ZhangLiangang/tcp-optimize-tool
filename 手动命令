@@ -1,147 +1,444 @@
-bash <<'BASH'
-set -e
+sudo bash <<'BASH'
+set -Eeuo pipefail
 
-CONF="/etc/sysctl.d/99-vps-net.conf"
-BACKUP_DIR="/root/sysctl-backup-$(date +%F-%H%M%S)"
+CONF="/etc/sysctl.d/99-vps-ultimate-net.conf"
+BACKUP_DIR="/root/vps-net-backup-$(date +%F-%H%M%S)"
 
-echo "===== 1. 检查是否为 root ====="
+log()  { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+echo "===== 1. 检查 root / 系统 ====="
+
 if [ "$(id -u)" -ne 0 ]; then
-    echo "错误：请使用 root 执行。"
-    echo "可以先运行：sudo -i"
-    exit 1
+    die "请使用 root 执行。"
 fi
 
+if [ -r /etc/os-release ]; then
+    . /etc/os-release
+
+    case "${ID:-}" in
+        debian|ubuntu)
+            log "系统：${PRETTY_NAME:-$ID}"
+            ;;
+        *)
+            warn "当前系统不是 Debian/Ubuntu：${PRETTY_NAME:-unknown}"
+            warn "继续执行，但本脚本主要针对 Debian / Ubuntu VPS。"
+            ;;
+    esac
+fi
+
+
 echo
-echo "===== 2. 检查 BBR 支持 ====="
+echo "===== 2. 检查 BBR / fq 支持 ====="
+
+# BBR / BBR2 可能以内核模块形式存在
 modprobe tcp_bbr 2>/dev/null || true
+modprobe tcp_bbr2 2>/dev/null || true
 
-AVAILABLE_CC="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+# fq 也可能以内核模块形式存在
+modprobe sch_fq 2>/dev/null || true
 
-echo "当前可用 TCP 拥塞算法：$AVAILABLE_CC"
+AVAILABLE_CC="$(
+    sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true
+)"
 
-if echo "$AVAILABLE_CC" | grep -qw "bbr"; then
-    echo "检测结果：支持 BBR，可以继续。"
+echo "当前可用 TCP 拥塞算法：${AVAILABLE_CC:-<无法读取>}"
+
+CC=""
+
+if grep -qw bbr2 <<<"$AVAILABLE_CC"; then
+    CC="bbr2"
+elif grep -qw bbr <<<"$AVAILABLE_CC"; then
+    CC="bbr"
 else
-    echo "错误：当前 VPS 内核不支持 BBR。"
-    echo "不会继续修改配置。"
     echo
-    echo "当前内核："
-    uname -r
-    echo
-    echo "建议：更换 Debian 11/12、Ubuntu 20.04+、Ubuntu 22.04+、Ubuntu 24.04+，或升级内核。"
-    exit 1
+    echo "当前内核：$(uname -r)"
+    die "当前内核未提供 BBR/BBR2；未修改任何 sysctl 配置。"
 fi
 
+echo "选择拥塞控制算法：$CC"
+echo "选择 qdisc：fq"
+
+
 echo
-echo "===== 3. 创建备份目录 ====="
+echo "===== 3. 根据 VPS 内存计算自适应参数 ====="
+
+MEM_KB="$(
+    awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo
+)"
+
+if ! [[ "$MEM_KB" =~ ^[0-9]+$ ]]; then
+    die "无法正确读取系统内存。"
+fi
+
+if (( MEM_KB < 1048576 )); then
+
+    PROFILE="tiny (<1 GiB)"
+
+    TCP_MAX=$((16 * 1024 * 1024))
+    BACKLOG=8192
+    SOMAXCONN=8192
+
+elif (( MEM_KB < 2097152 )); then
+
+    PROFILE="small (1-2 GiB)"
+
+    TCP_MAX=$((32 * 1024 * 1024))
+    BACKLOG=16384
+    SOMAXCONN=16384
+
+elif (( MEM_KB < 8388608 )); then
+
+    PROFILE="standard (2-8 GiB)"
+
+    TCP_MAX=$((64 * 1024 * 1024))
+    BACKLOG=32768
+    SOMAXCONN=32768
+
+else
+
+    PROFILE="large (>=8 GiB)"
+
+    TCP_MAX=$((128 * 1024 * 1024))
+    BACKLOG=65536
+    SOMAXCONN=65535
+
+fi
+
+echo "MemTotal：$((MEM_KB / 1024)) MiB"
+echo "Profile：$PROFILE"
+echo "TCP buffer max：$TCP_MAX"
+echo "netdev_max_backlog：$BACKLOG"
+echo "somaxconn：$SOMAXCONN"
+
+
+echo
+echo "===== 4. 备份现有 sysctl 配置 ====="
+
 mkdir -p "$BACKUP_DIR"
 
-echo "===== 4. 备份 sysctl 配置 ====="
-cp -a /etc/sysctl.conf "$BACKUP_DIR/sysctl.conf.bak" 2>/dev/null || true
-cp -a /etc/sysctl.d "$BACKUP_DIR/sysctl.d.bak" 2>/dev/null || true
+if [ -f /etc/sysctl.conf ]; then
+    cp -a /etc/sysctl.conf \
+        "$BACKUP_DIR/sysctl.conf"
+fi
 
-echo "备份位置：$BACKUP_DIR"
+if [ -d /etc/sysctl.d ]; then
+    cp -a /etc/sysctl.d \
+        "$BACKUP_DIR/sysctl.d"
+fi
 
-echo
-echo "===== 5. 注释旧配置中的冲突参数 ====="
+echo "备份位置："
+echo "$BACKUP_DIR"
 
-KEYS='net.core.default_qdisc|net.ipv4.tcp_congestion_control|net.core.somaxconn|net.core.netdev_max_backlog|net.core.rmem_max|net.core.wmem_max|net.core.rmem_default|net.core.wmem_default|net.ipv4.tcp_fastopen|net.ipv4.tcp_mtu_probing|net.ipv4.tcp_slow_start_after_idle|net.ipv4.tcp_keepalive_time|net.ipv4.tcp_keepalive_intvl|net.ipv4.tcp_keepalive_probes|net.ipv4.ip_local_port_range'
-
-for f in /etc/sysctl.conf /etc/sysctl.d/*.conf; do
-    [ -f "$f" ] || continue
-    [ "$f" = "$CONF" ] && continue
-
-    sed -i.bak -E "/^[[:space:]]*(${KEYS})[[:space:]]*=/s/^/# disabled by 99-vps-net: /" "$f"
-done
 
 echo
-echo "===== 6. 写入新的网络优化配置 ====="
+echo "===== 5. 读取当前 TCP buffer 基础值 ====="
 
-cat > "$CONF" <<'EOF'
+RVALUES="$(
+    sysctl -n net.ipv4.tcp_rmem 2>/dev/null \
+        || echo "4096 131072 6291456"
+)"
+
+WVALUES="$(
+    sysctl -n net.ipv4.tcp_wmem 2>/dev/null \
+        || echo "4096 16384 4194304"
+)"
+
+read -r RMIN RDEF _ <<<"$RVALUES"
+read -r WMIN WDEF _ <<<"$WVALUES"
+
+# 防止异常系统返回无效数据
+
+[[ "$RMIN" =~ ^[0-9]+$ ]] || RMIN=4096
+[[ "$RDEF" =~ ^[0-9]+$ ]] || RDEF=131072
+
+[[ "$WMIN" =~ ^[0-9]+$ ]] || WMIN=4096
+[[ "$WDEF" =~ ^[0-9]+$ ]] || WDEF=16384
+
+# 确保 min <= default <= max
+
+if (( RDEF > TCP_MAX )); then
+    RDEF="$TCP_MAX"
+fi
+
+if (( WDEF > TCP_MAX )); then
+    WDEF="$TCP_MAX"
+fi
+
+if (( RMIN > RDEF )); then
+    RMIN="$RDEF"
+fi
+
+if (( WMIN > WDEF )); then
+    WMIN="$WDEF"
+fi
+
+echo "tcp_rmem："
+echo "  min     = $RMIN"
+echo "  default = $RDEF"
+echo "  max     = $TCP_MAX"
+
+echo
+
+echo "tcp_wmem："
+echo "  min     = $WMIN"
+echo "  default = $WDEF"
+echo "  max     = $TCP_MAX"
+
+
+echo
+echo "===== 6. 写入新的 VPS 网络配置 ====="
+
+cat > "$CONF" <<EOF
+# ============================================================
 # VPS network optimization
+# Debian / Ubuntu
+#
+# Generated: $(date -Is)
+# Memory profile: $PROFILE
+# MemTotal: ${MEM_KB} KiB
+# ============================================================
 
-# BBR
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
 
-# Queue
-net.core.somaxconn=65535
-net.core.netdev_max_backlog=250000
+# ------------------------------------------------------------
+# Congestion control / Queue Discipline
+# ------------------------------------------------------------
 
-# Buffer
-net.core.rmem_max=134217728
-net.core.wmem_max=134217728
-net.core.rmem_default=4194304
-net.core.wmem_default=4194304
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = $CC
 
-# TCP
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_slow_start_after_idle=0
 
-# Keepalive
-net.ipv4.tcp_keepalive_time=600
-net.ipv4.tcp_keepalive_intvl=30
-net.ipv4.tcp_keepalive_probes=5
+# ------------------------------------------------------------
+# Adaptive socket / network queue limits
+# ------------------------------------------------------------
 
-# Port
-net.ipv4.ip_local_port_range=10240 65535
+net.core.rmem_max = $TCP_MAX
+net.core.wmem_max = $TCP_MAX
+
+net.core.netdev_max_backlog = $BACKLOG
+net.core.somaxconn = $SOMAXCONN
+
+
+# ------------------------------------------------------------
+# TCP buffer auto tuning
+# ------------------------------------------------------------
+
+net.ipv4.tcp_rmem = $RMIN $RDEF $TCP_MAX
+net.ipv4.tcp_wmem = $WMIN $WDEF $TCP_MAX
+
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_window_scaling = 1
+
+
+# ------------------------------------------------------------
+# Standard TCP features
+# ------------------------------------------------------------
+
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_timestamps = 1
+
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+
+net.ipv4.tcp_syncookies = 1
+
+net.ipv4.tcp_slow_start_after_idle = 0
 EOF
 
-echo
-echo "===== 7. 应用 sysctl 配置 ====="
-sysctl --system >/dev/null || true
+chmod 0644 "$CONF"
+
+echo "配置文件已写入："
+echo "$CONF"
+
 
 echo
-echo "===== 8. 强制加载目标配置 ====="
+echo "===== 7. 应用配置 ====="
+
+#
+# 注意：
+#
+# 这里故意不执行：
+#
+#   sysctl --system
+#
+# 因为 --system 会重新加载所有 sysctl 文件，
+# /etc/sysctl.conf 等旧配置可能再次覆盖刚才的设置。
+#
+# 只加载本文件。
+#
+
 sysctl -p "$CONF"
 
-echo
-echo "===== 9. 最终检查结果 ====="
 
 echo
-echo "===== BBR / QDISC ====="
+echo "===== 8. 验证 BBR / QDISC ====="
+
 sysctl net.core.default_qdisc
 sysctl net.ipv4.tcp_congestion_control
 sysctl net.ipv4.tcp_available_congestion_control
 
+
 echo
-echo "===== Queue ====="
+echo "===== 9. 验证 Queue ====="
+
 sysctl net.core.somaxconn
 sysctl net.core.netdev_max_backlog
 
+
 echo
-echo "===== Buffer ====="
+echo "===== 10. 验证 Buffer ====="
+
 sysctl net.core.rmem_max
 sysctl net.core.wmem_max
-sysctl net.core.rmem_default
-sysctl net.core.wmem_default
+
+sysctl net.ipv4.tcp_rmem
+sysctl net.ipv4.tcp_wmem
+
+sysctl net.ipv4.tcp_moderate_rcvbuf
+
 
 echo
-echo "===== TCP ====="
+echo "===== 11. 验证 TCP 功能 ====="
+
+sysctl net.ipv4.tcp_window_scaling
+sysctl net.ipv4.tcp_sack
+sysctl net.ipv4.tcp_timestamps
+
 sysctl net.ipv4.tcp_fastopen
 sysctl net.ipv4.tcp_mtu_probing
+sysctl net.ipv4.tcp_syncookies
+
 sysctl net.ipv4.tcp_slow_start_after_idle
 
-echo
-echo "===== Keepalive ====="
-sysctl net.ipv4.tcp_keepalive_time
-sysctl net.ipv4.tcp_keepalive_intvl
-sysctl net.ipv4.tcp_keepalive_probes
 
 echo
-echo "===== Port Range ====="
-sysctl net.ipv4.ip_local_port_range
+echo "===== 12. 检查其他配置文件中的重复定义 ====="
+
+KEY_RE='net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control|net\.core\.somaxconn|net\.core\.netdev_max_backlog|net\.core\.rmem_max|net\.core\.wmem_max|net\.ipv4\.tcp_rmem|net\.ipv4\.tcp_wmem|net\.ipv4\.tcp_moderate_rcvbuf|net\.ipv4\.tcp_window_scaling|net\.ipv4\.tcp_fastopen|net\.ipv4\.tcp_mtu_probing|net\.ipv4\.tcp_syncookies|net\.ipv4\.tcp_slow_start_after_idle'
+
+CONFLICTS="$(
+    grep -HEn \
+        "^[[:space:]]*(${KEY_RE})[[:space:]]*=" \
+        /etc/sysctl.conf \
+        /etc/sysctl.d/*.conf \
+        2>/dev/null \
+    | grep -v "^${CONF}:" \
+    || true
+)"
+
+if [ -n "$CONFLICTS" ]; then
+
+    echo
+    warn "发现其他配置文件也定义了相关参数："
+    echo
+
+    printf '%s\n' "$CONFLICTS"
+
+    echo
+    warn "本脚本没有自动修改这些文件。"
+    warn "这是故意的，以避免破坏其他软件或系统配置。"
+
+    echo
+    warn "当前运行值已经由 $CONF 正确应用。"
+    warn "如果以后手工执行 sysctl --system，请再次检查最终参数。"
+
+else
+
+    echo "未发现其他活动 sysctl 文件中的重复定义。"
+
+fi
+
 
 echo
-echo "===== 10. 检查是否还有重复冲突项 ====="
-grep -R "net.core.somaxconn\|net.core.default_qdisc\|net.ipv4.tcp_congestion_control\|net.core.netdev_max_backlog\|net.core.rmem_max\|net.core.wmem_max\|net.ipv4.ip_local_port_range" /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null || true
+echo "===== 13. 最终检查 ====="
+
+CURRENT_CC="$(
+    sysctl -n net.ipv4.tcp_congestion_control
+)"
+
+CURRENT_QDISC="$(
+    sysctl -n net.core.default_qdisc
+)"
+
+CURRENT_BACKLOG="$(
+    sysctl -n net.core.netdev_max_backlog
+)"
+
+CURRENT_RMAX="$(
+    sysctl -n net.core.rmem_max
+)"
+
+CURRENT_WMAX="$(
+    sysctl -n net.core.wmem_max
+)"
+
+FAIL=0
+
+if [ "$CURRENT_CC" = "$CC" ]; then
+    echo "OK: congestion_control = $CURRENT_CC"
+else
+    echo "FAIL: congestion_control = $CURRENT_CC"
+    FAIL=1
+fi
+
+if [ "$CURRENT_QDISC" = "fq" ]; then
+    echo "OK: default_qdisc = fq"
+else
+    echo "FAIL: default_qdisc = $CURRENT_QDISC"
+    FAIL=1
+fi
+
+if [ "$CURRENT_BACKLOG" -eq "$BACKLOG" ]; then
+    echo "OK: netdev_max_backlog = $CURRENT_BACKLOG"
+else
+    echo "FAIL: netdev_max_backlog = $CURRENT_BACKLOG"
+    FAIL=1
+fi
+
+if [ "$CURRENT_RMAX" -eq "$TCP_MAX" ]; then
+    echo "OK: rmem_max = $CURRENT_RMAX"
+else
+    echo "FAIL: rmem_max = $CURRENT_RMAX"
+    FAIL=1
+fi
+
+if [ "$CURRENT_WMAX" -eq "$TCP_MAX" ]; then
+    echo "OK: wmem_max = $CURRENT_WMAX"
+else
+    echo "FAIL: wmem_max = $CURRENT_WMAX"
+    FAIL=1
+fi
+
 
 echo
-echo "===== 完成 ====="
-echo "重点确认下面几项："
-echo "net.core.default_qdisc 应为 fq"
-echo "net.ipv4.tcp_congestion_control 应为 bbr"
-echo "net.core.somaxconn 应为 65535"
-echo "net.core.netdev_max_backlog 应为 250000"
+echo "============================================================"
+echo "完成"
+echo "============================================================"
+
+echo
+echo "拥塞控制：$CC"
+echo "qdisc：fq"
+echo "内存 Profile：$PROFILE"
+echo "配置文件：$CONF"
+echo "备份目录：$BACKUP_DIR"
+
+if (( FAIL == 0 )); then
+    echo
+    echo "所有核心参数检查通过。"
+else
+    echo
+    echo "警告：存在未达到预期值的核心参数，请检查上面的输出。"
+    exit 1
+fi
+
+echo
+echo "建议重启一次，然后再次执行："
+echo
+echo "sysctl net.core.default_qdisc"
+echo "sysctl net.ipv4.tcp_congestion_control"
+echo "sysctl net.core.netdev_max_backlog"
+echo "sysctl net.core.rmem_max net.core.wmem_max"
+echo "sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem"
+
 BASH
