@@ -1,244 +1,692 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+shopt -s nullglob
 
-# ========== 基本信息 ==========
+# vps-ultimate-net v2
+# Adaptive TCP/network tuning for modern Ubuntu/Debian VPS.
+# Safe design goals:
+#   - apply/repair are the only commands that change persistent tuning.
+#   - diagnose/status/selftest are read-only.
+#   - BBR is a hard requirement for apply/repair.
+#   - GRO/GSO/TSO are never disabled automatically.
+#   - RPS/XPS are configured according to CPU/queue topology, not "all queues -> all CPUs".
+#   - a first-run baseline is saved and rollback restores that baseline.
+
 SCRIPT_NAME="vps-ultimate-net"
+SCRIPT_VERSION="2.0.0"
+
 SYSCTL_FILE="/etc/sysctl.d/99-${SCRIPT_NAME}.conf"
 LIMITS_FILE="/etc/security/limits.d/99-${SCRIPT_NAME}.conf"
 SYSTEMD_DROPIN="/etc/systemd/system.conf.d/99-${SCRIPT_NAME}.conf"
 RPS_SERVICE="/etc/systemd/system/${SCRIPT_NAME}-rps.service"
 RPS_SCRIPT="/usr/local/sbin/${SCRIPT_NAME}-rps-apply.sh"
-ETHTOOL_SERVICE="/etc/systemd/system/${SCRIPT_NAME}-ethtool.service"
+LEGACY_ETHTOOL_SERVICE="/etc/systemd/system/${SCRIPT_NAME}-ethtool.service"
+
 BACKUP_DIR="/var/backups/${SCRIPT_NAME}"
+BASELINE_DIR="${BACKUP_DIR}/baseline-v2"
+BASELINE_STATE="${BASELINE_DIR}/files.tsv"
+BASELINE_RPS_STATE="${BASELINE_DIR}/rps-xps.tsv"
+BASELINE_SYSCTL_STATE="${BASELINE_DIR}/sysctl.tsv"
+BASELINE_SERVICE_STATE="${BASELINE_DIR}/services.tsv"
+
 LOG_TAG="${SCRIPT_NAME}"
 
-log()  { echo -e "[${LOG_TAG}] $*"; }
-warn() { echo -e "[${LOG_TAG}] \033[33m$*\033[0m"; }
-err()  { echo -e "[${LOG_TAG}] \033[31m$*\033[0m" >&2; }
+# ------------------------------ output ------------------------------
+if [[ -t 1 ]]; then
+  C_GREEN='\033[0;32m'
+  C_YELLOW='\033[1;33m'
+  C_RED='\033[0;31m'
+  C_BLUE='\033[1;34m'
+  C_NC='\033[0m'
+else
+  C_GREEN=''
+  C_YELLOW=''
+  C_RED=''
+  C_BLUE=''
+  C_NC=''
+fi
+
+log()  { printf '[%s] %b%s%b\n' "$LOG_TAG" "$C_GREEN" "$*" "$C_NC"; }
+info() { printf '[%s] %s\n' "$LOG_TAG" "$*"; }
+warn() { printf '[%s] %bWARNING:%b %s\n' "$LOG_TAG" "$C_YELLOW" "$C_NC" "$*" >&2; }
+err()  { printf '[%s] %bERROR:%b %s\n' "$LOG_TAG" "$C_RED" "$C_NC" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
 
 need_root() {
-  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    err "请以 root 运行：sudo bash $0 <apply|status|selftest|diagnose|diagnose aggressive|rollback|purge>"
-    exit 1
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "此操作需要 root：sudo $0 $*"
+}
+
+# ------------------------------ platform ------------------------------
+OS_ID="unknown"
+OS_PRETTY="unknown"
+HAS_SYSTEMD=0
+
+load_os_info() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_PRETTY="${PRETTY_NAME:-$OS_ID}"
+  fi
+
+  if have systemctl && [[ -d /run/systemd/system ]]; then
+    HAS_SYSTEMD=1
+  else
+    HAS_SYSTEMD=0
   fi
 }
 
-detect_iface() {
-  local cand
-  # 首选有 IPv4 地址、非 lo / 容器设备
-  for cand in /sys/class/net/*; do
-    cand=$(basename "$cand")
-    [[ "$cand" == "lo" ]] && continue
-    [[ "$cand" == docker* || "$cand" == veth* || "$cand" == br-* || "$cand" == "tailscale0" ]] && continue
-    ip -o -4 addr show dev "$cand" | grep -q 'inet ' && { echo "$cand"; return; }
-  done
-  # 退而求其次，选任意非 lo 设备
-  for cand in /sys/class/net/*; do
-    cand=$(basename "$cand")
-    [[ "$cand" == "lo" ]] || { echo "$cand"; return; }
-  done
-}
-
-# ========== BBR 检测（最低要求：必须支持 BBR/BBR2） ==========
-support_bbr2=0
-support_bbr=0
-BBR_MIN_REQUIRED=1       # 你的要求：最低必须 BBR
-HAVE_BBR=0               # 实际检测到是否有 BBR/BBR2
-BBR_HARD_FAIL=0          # 若最终无 BBR，则在自检中给出硬错误
-
-detect_bbr() {
-  local avail
-
-  support_bbr2=0
-  support_bbr=0
-  HAVE_BBR=0
-  BBR_HARD_FAIL=0
-
-  # 尝试加载 BBR 模块（有些内核是模块形式）
-  if command -v modprobe >/dev/null 2>&1; then
-    modprobe tcp_bbr  2>/dev/null || true
-    modprobe tcp_bbr2 2>/dev/null || true
-  fi
-
-  if ! avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null); then
-    warn "无法读取 net.ipv4.tcp_available_congestion_control，假定当前不可用 BBR，将使用 cubic。"
-    if (( BBR_MIN_REQUIRED == 1 )); then
-      BBR_HARD_FAIL=1
-    fi
-    return
-  fi
-
-  if [[ "$avail" =~ (^|[[:space:]])bbr2([[:space:]]|$) ]]; then
-    support_bbr2=1
-    HAVE_BBR=1
-  fi
-  if [[ "$avail" =~ (^|[[:space:]])bbr([[:space:]]|$) ]]; then
-    support_bbr=1
-    HAVE_BBR=1
-  fi
-
-  if (( BBR_MIN_REQUIRED == 1 && HAVE_BBR == 0 )); then
-    BBR_HARD_FAIL=1
-    warn "内核当前未提供 BBR/BBR2 拥塞控制算法，不满足最低要求。将暂时使用 cubic，但自检会标记为 FAIL。"
-  fi
-}
-
-backup_once() {
-  mkdir -p "$BACKUP_DIR"
-  for f in "$SYSCTL_FILE" "$LIMITS_FILE" "$SYSTEMD_DROPIN" "$RPS_SERVICE" "$RPS_SCRIPT" "$ETHTOOL_SERVICE"; do
-    if [[ -f "$f" ]]; then
-      cp -a "$f" "$BACKUP_DIR/$(basename "$f").bak.$(date +%s)"
-      log "已备份：$f -> $BACKUP_DIR"
-    fi
-  done
+check_supported_os() {
+  load_os_info
+  case "$OS_ID" in
+    ubuntu|debian) ;;
+    *) warn "当前系统为 ${OS_PRETTY}；本工具主要针对 Ubuntu/Debian，继续运行前请确认兼容性。" ;;
+  esac
 }
 
 ensure_packages() {
+  need_root "$@"
+  have apt-get || die "未找到 apt-get；自动安装依赖仅支持 Debian/Ubuntu。"
+
+  local pkgs=(iproute2 procps ethtool kmod)
+  local missing=()
+  local p
+
+  for p in "${pkgs[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q '^Status: install ok installed$'; then
+      missing+=("$p")
+    fi
+  done
+
+  if (( ${#missing[@]} == 0 )); then
+    return 0
+  fi
+
   export DEBIAN_FRONTEND=noninteractive
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y iproute2 iperf3 ethtool procps >/dev/null 2>&1 || true
+  log "安装缺失依赖：${missing[*]}"
+
+  local attempt
+  for attempt in 1 2 3; do
+    if apt-get update && apt-get install -y --no-install-recommends "${missing[@]}"; then
+      return 0
+    fi
+    warn "APT 失败（${attempt}/3）"
+    sleep $((attempt * 2))
+  done
+
+  die "依赖安装失败。"
+}
+
+# ------------------------------ interface ------------------------------
+is_bad_iface() {
+  local d="$1"
+  [[ "$d" == lo || "$d" == docker* || "$d" == veth* || "$d" == br-* || "$d" == virbr* ]]
+}
+
+detect_iface() {
+  local dev=""
+
+  dev="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  if [[ -n "$dev" && -d "/sys/class/net/$dev" ]]; then
+    printf '%s\n' "$dev"
+    return 0
+  fi
+
+  dev="$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  if [[ -n "$dev" && -d "/sys/class/net/$dev" ]]; then
+    printf '%s\n' "$dev"
+    return 0
+  fi
+
+  local path
+  for path in /sys/class/net/*; do
+    [[ -e "$path" ]] || continue
+    dev="$(basename "$path")"
+    is_bad_iface "$dev" && continue
+    printf '%s\n' "$dev"
+    return 0
+  done
+
+  return 1
+}
+
+iface_driver() {
+  local iface="$1"
+  if have ethtool; then
+    ethtool -i "$iface" 2>/dev/null | awk -F': ' '/^driver:/{print $2; exit}'
+  fi
+}
+
+count_queues() {
+  local iface="$1" kind="$2"
+  local files=(/sys/class/net/"$iface"/queues/"$kind"-*)
+  printf '%s\n' "${#files[@]}"
+}
+
+# ------------------------------ BBR ------------------------------
+SUPPORT_BBR=0
+SUPPORT_BBR2=0
+SELECTED_CC=""
+
+refresh_bbr_support() {
+  SUPPORT_BBR=0
+  SUPPORT_BBR2=0
+  SELECTED_CC=""
+
+  local avail
+  avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+
+  [[ " $avail " == *" bbr "* ]] && SUPPORT_BBR=1
+  [[ " $avail " == *" bbr2 "* ]] && SUPPORT_BBR2=1
+
+  if (( SUPPORT_BBR2 == 1 )); then
+    SELECTED_CC="bbr2"
+  elif (( SUPPORT_BBR == 1 )); then
+    SELECTED_CC="bbr"
+  fi
+}
+
+load_bbr_modules() {
+  if have modprobe; then
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    modprobe tcp_bbr2 >/dev/null 2>&1 || true
+  fi
+}
+
+require_bbr() {
+  load_bbr_modules
+  refresh_bbr_support
+  [[ -n "$SELECTED_CC" ]] || die "当前内核未提供 BBR/BBR2。apply/repair 已中止，未写入任何持久化配置。"
+}
+
+# ------------------------------ adaptive profile ------------------------------
+MEM_KB=0
+TCP_MAX=0
+NETDEV_BACKLOG=0
+SOMAXCONN=0
+NOFILE_LIMIT=0
+PROFILE_NAME=""
+
+calculate_profile() {
+  MEM_KB="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)"
+  [[ "$MEM_KB" =~ ^[0-9]+$ ]] || MEM_KB=0
+
+  if (( MEM_KB < 1048576 )); then
+    PROFILE_NAME="tiny"
+    TCP_MAX=$((16 * 1024 * 1024))
+    NETDEV_BACKLOG=8192
+    SOMAXCONN=8192
+  elif (( MEM_KB < 2097152 )); then
+    PROFILE_NAME="small"
+    TCP_MAX=$((32 * 1024 * 1024))
+    NETDEV_BACKLOG=16384
+    SOMAXCONN=16384
+  elif (( MEM_KB < 8388608 )); then
+    PROFILE_NAME="standard"
+    TCP_MAX=$((64 * 1024 * 1024))
+    NETDEV_BACKLOG=32768
+    SOMAXCONN=32768
+  else
+    PROFILE_NAME="large"
+    TCP_MAX=$((128 * 1024 * 1024))
+    NETDEV_BACKLOG=65536
+    SOMAXCONN=65535
+  fi
+
+  local nr_open
+  nr_open="$(sysctl -n fs.nr_open 2>/dev/null || echo 1048576)"
+  [[ "$nr_open" =~ ^[0-9]+$ ]] || nr_open=1048576
+
+  if (( nr_open < 1048576 )); then
+    NOFILE_LIMIT="$nr_open"
+  else
+    NOFILE_LIMIT=1048576
+  fi
+}
+
+# ------------------------------ baseline backup ------------------------------
+managed_sysctl_keys() {
+  printf '%s\n' \
+    net.core.default_qdisc \
+    net.ipv4.tcp_congestion_control \
+    net.core.rmem_max \
+    net.core.wmem_max \
+    net.core.netdev_max_backlog \
+    net.core.somaxconn \
+    net.ipv4.tcp_rmem \
+    net.ipv4.tcp_wmem \
+    net.ipv4.tcp_moderate_rcvbuf \
+    net.ipv4.tcp_window_scaling \
+    net.ipv4.tcp_sack \
+    net.ipv4.tcp_timestamps \
+    net.ipv4.tcp_fastopen \
+    net.ipv4.tcp_mtu_probing \
+    net.ipv4.tcp_syncookies \
+    net.ipv4.tcp_slow_start_after_idle
+}
+
+managed_files() {
+  printf '%s\n' \
+    "$SYSCTL_FILE" \
+    "$LIMITS_FILE" \
+    "$SYSTEMD_DROPIN" \
+    "$RPS_SERVICE" \
+    "$RPS_SCRIPT" \
+    "$LEGACY_ETHTOOL_SERVICE"
+}
+
+backup_runtime_sysctl_once() {
+  [[ -e "$BASELINE_SYSCTL_STATE" ]] && return 0
+
+  : >"${BASELINE_SYSCTL_STATE}.tmp"
+  local key value
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    value="$(sysctl -n "$key" 2>/dev/null || true)"
+    if [[ -n "$value" ]]; then
+      printf '%s\t%s\n' "$key" "$value" >>"${BASELINE_SYSCTL_STATE}.tmp"
+    fi
+  done < <(managed_sysctl_keys)
+  mv -f "${BASELINE_SYSCTL_STATE}.tmp" "$BASELINE_SYSCTL_STATE"
+}
+
+backup_service_state_once() {
+  [[ -e "$BASELINE_SERVICE_STATE" ]] && return 0
+  : >"${BASELINE_SERVICE_STATE}.tmp"
+
+  if (( HAS_SYSTEMD == 1 )); then
+    local svc enabled active
+    for svc in "$(basename "$RPS_SERVICE")" "$(basename "$LEGACY_ETHTOOL_SERVICE")"; do
+      enabled="$(systemctl is-enabled "$svc" 2>/dev/null || true)"
+      active="$(systemctl is-active "$svc" 2>/dev/null || true)"
+      printf '%s\t%s\t%s\n' "$svc" "${enabled:-not-found}" "${active:-inactive}" >>"${BASELINE_SERVICE_STATE}.tmp"
+    done
+  fi
+
+  mv -f "${BASELINE_SERVICE_STATE}.tmp" "$BASELINE_SERVICE_STATE"
+}
+
+backup_runtime_rps_xps_once() {
+  [[ -e "$BASELINE_RPS_STATE" ]] && return 0
+
+  : >"${BASELINE_RPS_STATE}.tmp"
+  local f v
+  for f in /sys/class/net/*/queues/rx-*/rps_cpus /sys/class/net/*/queues/tx-*/xps_cpus; do
+    [[ -f "$f" ]] || continue
+    v="$(cat "$f" 2>/dev/null || true)"
+    printf '%s\t%s\n' "$f" "$v" >>"${BASELINE_RPS_STATE}.tmp"
+  done
+  mv -f "${BASELINE_RPS_STATE}.tmp" "$BASELINE_RPS_STATE"
+}
+
+backup_baseline_once() {
+  [[ -e "$BASELINE_STATE" ]] && return 0
+
+  mkdir -p "$BASELINE_DIR/rootfs"
+  : >"${BASELINE_STATE}.tmp"
+
+  local f backup_path
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if [[ -e "$f" || -L "$f" ]]; then
+      printf 'present\t%s\n' "$f" >>"${BASELINE_STATE}.tmp"
+      backup_path="${BASELINE_DIR}/rootfs${f}"
+      mkdir -p "$(dirname "$backup_path")"
+      cp -a "$f" "$backup_path"
+    else
+      printf 'absent\t%s\n' "$f" >>"${BASELINE_STATE}.tmp"
+    fi
+  done < <(managed_files)
+
+  mv -f "${BASELINE_STATE}.tmp" "$BASELINE_STATE"
+  backup_runtime_sysctl_once
+  backup_runtime_rps_xps_once
+  backup_service_state_once
+  log "已保存 V2 基线：$BASELINE_DIR"
+}
+
+restore_baseline_files() {
+  [[ -r "$BASELINE_STATE" ]] || die "没有找到 V2 baseline，无法执行真正的 rollback。"
+
+  local state f src
+  while IFS=$'\t' read -r state f; do
+    [[ -n "${f:-}" ]] || continue
+    case "$state" in
+      present)
+        src="${BASELINE_DIR}/rootfs${f}"
+        [[ -e "$src" || -L "$src" ]] || { warn "baseline 缺少：$src"; continue; }
+        mkdir -p "$(dirname "$f")"
+        rm -rf "$f"
+        cp -a "$src" "$f"
+        ;;
+      absent)
+        rm -rf "$f"
+        ;;
+    esac
+  done <"$BASELINE_STATE"
+}
+
+restore_runtime_rps_xps() {
+  [[ -r "$BASELINE_RPS_STATE" ]] || return 0
+  local f v
+  while IFS=$'\t' read -r f v; do
+    [[ -n "${f:-}" && -w "$f" ]] || continue
+    printf '%s\n' "$v" >"$f" 2>/dev/null || true
+  done <"$BASELINE_RPS_STATE"
+}
+
+restore_runtime_sysctl() {
+  [[ -r "$BASELINE_SYSCTL_STATE" ]] || return 0
+  local key value
+  while IFS=$'\t' read -r key value; do
+    [[ -n "${key:-}" ]] || continue
+    sysctl -w "${key}=${value}" >/dev/null 2>&1 || warn "无法恢复 runtime sysctl：$key"
+  done <"$BASELINE_SYSCTL_STATE"
+}
+
+restore_service_state() {
+  (( HAS_SYSTEMD == 1 )) || return 0
+  [[ -r "$BASELINE_SERVICE_STATE" ]] || return 0
+
+  systemctl daemon-reload || true
+  local svc enabled active
+  while IFS=$'\t' read -r svc enabled active; do
+    [[ -n "${svc:-}" ]] || continue
+    case "$enabled" in
+      enabled|enabled-runtime|linked|linked-runtime|alias)
+        systemctl enable "$svc" >/dev/null 2>&1 || true
+        ;;
+      disabled)
+        systemctl disable "$svc" >/dev/null 2>&1 || true
+        ;;
+    esac
+
+    if [[ "$active" == "active" ]]; then
+      systemctl start "$svc" >/dev/null 2>&1 || true
+    else
+      systemctl stop "$svc" >/dev/null 2>&1 || true
+    fi
+  done <"$BASELINE_SERVICE_STATE"
+}
+
+# ------------------------------ sysctl generation ------------------------------
+sysctl_exists() {
+  local key="$1"
+  [[ -e "/proc/sys/${key//./\/}" ]]
+}
+
+emit_sysctl() {
+  local key="$1" value="$2"
+  sysctl_exists "$key" && printf '%s = %s\n' "$key" "$value"
+}
+
+triple_or() {
+  local key="$1" fallback="$2" value
+  value="$(sysctl -n "$key" 2>/dev/null || true)"
+  if [[ "$value" =~ ^[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$fallback"
   fi
 }
 
 write_sysctl() {
-  detect_bbr
+  calculate_profile
+  refresh_bbr_support
+  [[ -n "$SELECTED_CC" ]] || die "BBR support disappeared before sysctl generation."
 
-  local qdisc="fq"
-  local cc="cubic"
+  local current_rmem current_wmem rmin rdef _rmax wmin wdef _wmax
+  current_rmem="$(triple_or net.ipv4.tcp_rmem '4096 131072 6291456')"
+  current_wmem="$(triple_or net.ipv4.tcp_wmem '4096 16384 4194304')"
+  read -r rmin rdef _rmax <<<"$current_rmem"
+  read -r wmin wdef _wmax <<<"$current_wmem"
 
-  # 优先级：bbr2 > bbr；若内核无 BBR，则仍用 cubic 但标记为硬错误
-  if (( HAVE_BBR == 1 )); then
-    if (( support_bbr2 == 1 )); then
-      cc="bbr2"
-    elif (( support_bbr == 1 )); then
-      cc="bbr"
-    fi
+  local tmp
+  tmp="$(mktemp)"
+  {
+    printf '# %s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+    printf '# Generated profile: %s; MemTotal=%s KiB\n' "$PROFILE_NAME" "$MEM_KB"
+    printf '# BBR + fq, adaptive buffers, conservative server-safe TCP settings.\n\n'
+
+    emit_sysctl net.core.default_qdisc fq
+    emit_sysctl net.ipv4.tcp_congestion_control "$SELECTED_CC"
+    printf '\n'
+
+    emit_sysctl net.core.rmem_max "$TCP_MAX"
+    emit_sysctl net.core.wmem_max "$TCP_MAX"
+    emit_sysctl net.core.netdev_max_backlog "$NETDEV_BACKLOG"
+    emit_sysctl net.core.somaxconn "$SOMAXCONN"
+    printf '\n'
+
+    emit_sysctl net.ipv4.tcp_rmem "$rmin $rdef $TCP_MAX"
+    emit_sysctl net.ipv4.tcp_wmem "$wmin $wdef $TCP_MAX"
+    emit_sysctl net.ipv4.tcp_moderate_rcvbuf 1
+    emit_sysctl net.ipv4.tcp_window_scaling 1
+    emit_sysctl net.ipv4.tcp_sack 1
+    emit_sysctl net.ipv4.tcp_timestamps 1
+    printf '\n'
+
+    emit_sysctl net.ipv4.tcp_fastopen 3
+    emit_sysctl net.ipv4.tcp_mtu_probing 1
+    emit_sysctl net.ipv4.tcp_syncookies 1
+    emit_sysctl net.ipv4.tcp_slow_start_after_idle 0
+  } >"$tmp"
+
+  install -m 0644 "$tmp" "$SYSCTL_FILE"
+  rm -f "$tmp"
+
+  log "已写入 sysctl：$SYSCTL_FILE（profile=$PROFILE_NAME, TCP_MAX=$TCP_MAX）"
+
+  if ! sysctl -p "$SYSCTL_FILE"; then
+    die "应用本工具 sysctl 失败。请检查上方具体键值错误。"
+  fi
+}
+
+# ------------------------------ limits ------------------------------
+write_limits() {
+  calculate_profile
+
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<LIMITS_EOF
+# ${SCRIPT_NAME} v${SCRIPT_VERSION}
+# Session file-descriptor limit for high-connection workloads.
+*    soft nofile ${NOFILE_LIMIT}
+*    hard nofile ${NOFILE_LIMIT}
+root soft nofile ${NOFILE_LIMIT}
+root hard nofile ${NOFILE_LIMIT}
+LIMITS_EOF
+  install -m 0644 "$tmp" "$LIMITS_FILE"
+  rm -f "$tmp"
+
+  if (( HAS_SYSTEMD == 1 )); then
+    mkdir -p "$(dirname "$SYSTEMD_DROPIN")"
+    tmp="$(mktemp)"
+    cat >"$tmp" <<SYSTEMD_LIMIT_EOF
+# ${SCRIPT_NAME} v${SCRIPT_VERSION}
+[Manager]
+DefaultLimitNOFILE=${NOFILE_LIMIT}
+SYSTEMD_LIMIT_EOF
+    install -m 0644 "$tmp" "$SYSTEMD_DROPIN"
+    rm -f "$tmp"
   else
-    # 没有 BBR，只能安全使用 cubic，实际不满足你的“最低要求”
-    cc="cubic"
+    warn "未检测到 systemd；跳过 systemd manager NOFILE drop-in。"
   fi
 
-  cat >"$SYSCTL_FILE" <<EOF
-# ${SCRIPT_NAME}: 网络/内核性能增强（可安全回滚）
-# 队列与拥塞控制
-net.core.default_qdisc = ${qdisc}
-net.ipv4.tcp_congestion_control = ${cc}
-
-# 放大队列/缓冲（保守安全值）
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.core.rmem_default = 4194304
-net.core.wmem_default = 4194304
-net.core.netdev_max_backlog = 250000
-net.core.somaxconn = 65535
-
-# TCP 优化
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_fin_timeout = 20
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 10240 65535
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_window_scaling = 1
-
-# 兼容性
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.route.gc_timeout = 100
-net.ipv4.neigh.default.gc_thresh1 = 4096
-net.ipv4.neigh.default.gc_thresh2 = 8192
-net.ipv4.neigh.default.gc_thresh3 = 16384
-net.ipv4.tcp_timestamps = 1
-EOF
-
-  log "已写入 sysctl 配置：$SYSCTL_FILE"
-  sysctl --system >/dev/null || sysctl -p "$SYSCTL_FILE" || true
+  log "NOFILE 目标值：$NOFILE_LIMIT"
 }
 
-write_limits() {
-  cat >"$LIMITS_FILE" <<'EOF'
-# 提高文件句柄与进程数限制（对高并发服务必要）
-* soft nofile 1048576
-* hard nofile 1048576
-* soft nproc  262144
-* hard nproc  262144
-root soft nofile 1048576
-root hard nofile 1048576
-root soft nproc  262144
-root hard nproc  262144
-EOF
-
-  mkdir -p "$(dirname "$SYSTEMD_DROPIN")"
-  cat > "$SYSTEMD_DROPIN" <<'EOF'
-[Manager]
-DefaultLimitNOFILE=1048576
-DefaultLimitNPROC=262144
-EOF
-
-  log "已写入 limits：$LIMITS_FILE 与 systemd drop-in：$SYSTEMD_DROPIN"
-}
-
+# ------------------------------ adaptive RPS/XPS runtime script ------------------------------
 write_rps_script() {
-  cat >"$RPS_SCRIPT" <<'EOS'
-#!/usr/bin/env bash
-set -euo pipefail
+  local tmp
+  tmp="$(mktemp)"
 
-mask_all_cpus() {
-  local ncpus mask=0 i=0
-  ncpus=$(nproc)
-  while (( i < ncpus )); do
-    mask=$((mask | (1<<i) ))
-    ((i++))
-  done
-  printf "%x\n" "$mask"
+  cat >"$tmp" <<'RPS_SCRIPT_EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+shopt -s nullglob
+
+is_bad_iface() {
+  local d="$1"
+  [[ "$d" == lo || "$d" == docker* || "$d" == veth* || "$d" == br-* || "$d" == virbr* ]]
 }
 
-apply_rps_for_iface() {
-  local IFACE="$1"
-  local mask
-  mask=$(mask_all_cpus)
+detect_iface() {
+  local dev=""
+  dev="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  if [[ -n "$dev" && -d "/sys/class/net/$dev" ]]; then printf '%s\n' "$dev"; return 0; fi
 
-  local rxq
-  for rxq in /sys/class/net/"$IFACE"/queues/rx-*; do
-    [[ -e "$rxq" ]] || continue
-    echo "$mask" > "$rxq/rps_cpus" || true
-    echo 32768 > "$rxq/rps_flow_cnt" || true
+  dev="$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  if [[ -n "$dev" && -d "/sys/class/net/$dev" ]]; then printf '%s\n' "$dev"; return 0; fi
+
+  local path
+  for path in /sys/class/net/*; do
+    [[ -e "$path" ]] || continue
+    dev="$(basename "$path")"
+    is_bad_iface "$dev" && continue
+    printf '%s\n' "$dev"
+    return 0
   done
+  return 1
+}
 
-  local txq
-  for txq in /sys/class/net/"$IFACE"/queues/tx-*; do
-    [[ -e "$txq" ]] || continue
-    if [[ -w "$txq/xps_cpus" ]]; then
-      echo "$mask" > "$txq/xps_cpus" || true
+expand_cpu_list() {
+  local spec="$1" part start end i
+  local -a parts
+  IFS=',' read -r -a parts <<<"$spec"
+  for part in "${parts[@]}"; do
+    if [[ "$part" == *-* ]]; then
+      start="${part%-*}"
+      end="${part#*-}"
+      for ((i=start; i<=end; i++)); do printf '%s\n' "$i"; done
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      printf '%s\n' "$part"
     fi
   done
+}
+
+online_cpus() {
+  local spec
+  spec="$(cat /sys/devices/system/cpu/online 2>/dev/null || true)"
+  if [[ -n "$spec" ]]; then
+    expand_cpu_list "$spec"
+  else
+    local n i
+    n="$(nproc)"
+    for ((i=0; i<n; i++)); do printf '%s\n' "$i"; done
+  fi
+}
+
+cpumask_for_group() {
+  local group="$1" groups="$2"
+  local -a cpus=()
+  mapfile -t cpus < <(online_cpus)
+
+  local max_cpu=0 cpu
+  for cpu in "${cpus[@]}"; do
+    if (( cpu > max_cpu )); then max_cpu="$cpu"; fi
+  done
+
+  local words=$((max_cpu / 32 + 1))
+  local -a vals=()
+  local i word bit idx=0 hex out="" started=0
+  for ((i=0; i<words; i++)); do vals[i]=0; done
+
+  for cpu in "${cpus[@]}"; do
+    if (( idx % groups == group )); then
+      word=$((cpu / 32))
+      bit=$((cpu % 32))
+      vals[word]=$(( vals[word] | (1 << bit) ))
+    fi
+    idx=$((idx + 1))
+  done
+
+  for ((i=words-1; i>=0; i--)); do
+    printf -v hex '%08x' "${vals[i]}"
+    if (( started == 0 )); then
+      if [[ "$hex" == "00000000" && i -gt 0 ]]; then continue; fi
+      hex="${hex#0000000}"; hex="${hex#000000}"; hex="${hex#00000}"; hex="${hex#0000}"
+      hex="${hex#000}"; hex="${hex#00}"; hex="${hex#0}"
+      [[ -n "$hex" ]] || hex="0"
+      out="$hex"
+      started=1
+    else
+      out+=",$hex"
+    fi
+  done
+
+  [[ -n "$out" ]] || out="0"
+  printf '%s\n' "$out"
 }
 
 main() {
-  for dev in /sys/class/net/*; do
-    dev=$(basename "$dev")
-    [[ "$dev" == "lo" ]] && continue
-    [[ "$dev" == docker* || "$dev" == veth* || "$dev" == br-* || "$dev" == "tailscale0" ]] && continue
-    if ip -o link show "$dev" >/dev/null 2>&1; then
-      apply_rps_for_iface "$dev"
-    fi
-  done
+  local iface
+  iface="$(detect_iface || true)"
+  [[ -n "$iface" ]] || exit 0
+
+  local -a cpus=() rxqs=() txqs=()
+  mapfile -t cpus < <(online_cpus)
+  rxqs=(/sys/class/net/"$iface"/queues/rx-*)
+  txqs=(/sys/class/net/"$iface"/queues/tx-*)
+
+  local ncpu="${#cpus[@]}" nrx="${#rxqs[@]}" ntx="${#txqs[@]}"
+  (( ncpu > 1 )) || exit 0
+
+  local i mask file
+
+  # RX: if queues >= CPUs, RSS/multiqueue is usually sufficient: disable extra RPS.
+  # Otherwise, assign a disjoint CPU group to each RX queue.
+  if (( nrx > 0 )); then
+    for ((i=0; i<nrx; i++)); do
+      file="${rxqs[i]}/rps_cpus"
+      [[ -w "$file" ]] || continue
+      if (( nrx >= ncpu )); then
+        printf '0\n' >"$file" || true
+      else
+        mask="$(cpumask_for_group "$i" "$nrx")"
+        printf '%s\n' "$mask" >"$file" || true
+      fi
+    done
+  fi
+
+  # TX: XPS has no effect on a single TX queue. For multiple queues, split CPUs.
+  if (( ntx > 0 )); then
+    for ((i=0; i<ntx; i++)); do
+      file="${txqs[i]}/xps_cpus"
+      [[ -w "$file" ]] || continue
+      if (( ntx <= 1 )); then
+        printf '0\n' >"$file" || true
+      else
+        mask="$(cpumask_for_group "$i" "$ntx")"
+        printf '%s\n' "$mask" >"$file" || true
+      fi
+    done
+  fi
 }
-main
-EOS
-  chmod +x "$RPS_SCRIPT"
-  log "已生成 RPS 应用脚本：$RPS_SCRIPT"
+
+main "$@"
+RPS_SCRIPT_EOF
+
+  install -m 0755 "$tmp" "$RPS_SCRIPT"
+  rm -f "$tmp"
+  log "已生成自适应 RPS/XPS 脚本：$RPS_SCRIPT"
 }
 
 write_rps_service() {
-  cat >"$RPS_SERVICE" <<EOF
+  if (( HAS_SYSTEMD == 0 )); then
+    warn "未检测到 systemd；RPS/XPS 只应用当前运行时，不创建开机服务。"
+    "$RPS_SCRIPT" || true
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<RPS_SERVICE_EOF
 [Unit]
-Description=Apply RPS/XPS settings for ${SCRIPT_NAME}
-After=network-online.target
-Wants=network-online.target
+Description=Adaptive RPS/XPS for ${SCRIPT_NAME}
+After=network.target
 
 [Service]
 Type=oneshot
@@ -247,465 +695,457 @@ RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-EOF
+RPS_SERVICE_EOF
+  install -m 0644 "$tmp" "$RPS_SERVICE"
+  rm -f "$tmp"
+
   systemctl daemon-reload
-  systemctl enable --now "$(basename "$RPS_SERVICE")" || true
-  log "已安装并启用 RPS/XPS 开机服务：$(basename "$RPS_SERVICE")"
+  systemctl enable "$(basename "$RPS_SERVICE")" >/dev/null 2>&1 || true
+  systemctl restart "$(basename "$RPS_SERVICE")" || "$RPS_SCRIPT" || true
+  log "已启用自适应 RPS/XPS：$(basename "$RPS_SERVICE")"
 }
 
-# ========== 自检模块 ==========
+remove_legacy_offload_service() {
+  if [[ ! -e "$LEGACY_ETHTOOL_SERVICE" ]]; then
+    return 0
+  fi
+
+  if (( HAS_SYSTEMD == 1 )); then
+    systemctl disable --now "$(basename "$LEGACY_ETHTOOL_SERVICE")" >/dev/null 2>&1 || true
+  fi
+  rm -f "$LEGACY_ETHTOOL_SERVICE"
+  warn "已移除旧版自动关闭 GRO/GSO/TSO 的持久化 service。当前运行时 offload 状态未被强制修改；重启后由驱动恢复默认。"
+}
+
+# ------------------------------ checks ------------------------------
 PASS_CNT=0
+WARN_CNT=0
 FAIL_CNT=0
 
-record() {
-  local ok="$1" msg="$2"
-  if [[ "$ok" == "1" ]]; then
-    echo -e "✅  $msg"
-    PASS_CNT=$((PASS_CNT+1))
-  else
-    echo -e "❌  $msg"
-    FAIL_CNT=$((FAIL_CNT+1))
-  fi
-}
+pass() { printf '%b✔%b %s\n' "$C_GREEN" "$C_NC" "$*"; PASS_CNT=$((PASS_CNT + 1)); }
+softwarn() { printf '%b⚠%b %s\n' "$C_YELLOW" "$C_NC" "$*"; WARN_CNT=$((WARN_CNT + 1)); }
+fail() { printf '%b✘%b %s\n' "$C_RED" "$C_NC" "$*"; FAIL_CNT=$((FAIL_CNT + 1)); }
 
-check_eq() { # key expected
+check_eq() {
   local key="$1" expected="$2" got
-  got=$(sysctl -n "$key" 2>/dev/null || echo "")
+  got="$(sysctl -n "$key" 2>/dev/null || true)"
   if [[ "$got" == "$expected" ]]; then
-    record 1 "sysctl $key = $expected"
+    pass "$key = $expected"
   else
-    record 0 "sysctl $key 期望=$expected 实际=${got:-<空>}"
+    fail "$key 期望=$expected，实际=${got:-<empty>}"
   fi
 }
 
-check_ge() { # key >= min
+check_ge() {
   local key="$1" min="$2" got
-  got=$(sysctl -n "$key" 2>/dev/null || echo 0)
+  got="$(sysctl -n "$key" 2>/dev/null || echo 0)"
   if [[ "$got" =~ ^[0-9]+$ ]] && (( got >= min )); then
-    record 1 "sysctl $key >= $min (当前 $got)"
+    pass "$key >= $min（当前 $got）"
   else
-    record 0 "sysctl $key 应>= $min (当前 ${got})"
-  fi
-}
-
-check_file_exists() {
-  local f="$1"
-  if [[ -f "$f" ]]; then
-    record 1 "存在文件：$f"
-  else
-    record 0 "缺少文件：$f"
-  fi
-}
-
-check_service_enabled() {
-  local svc
-  svc="$(basename "$1")"
-  if systemctl is-enabled "$svc" &>/dev/null; then
-    record 1 "systemd 服务已启用：$svc"
-  else
-    record 0 "systemd 服务未启用：$svc"
-  fi
-  if systemctl is-active "$svc" &>/dev/null; then
-    record 1 "systemd 服务已运行：$svc"
-  else
-    record 0 "systemd 服务未运行：$svc"
-  fi
-}
-
-check_rps_xps_nonzero() {
-  local dev rxfile txfile v any ok
-  for dev in /sys/class/net/*; do
-    dev=$(basename "$dev")
-    [[ "$dev" == "lo" ]] && continue
-    [[ "$dev" == docker* || "$dev" == veth* || "$dev" == br-* || "$dev" == "tailscale0" ]] && continue
-    if [[ -d "/sys/class/net/$dev/queues" ]]; then
-      any=0
-      ok=1
-      for rxfile in /sys/class/net/"$dev"/queues/rx-*/rps_cpus; do
-        [[ -f "$rxfile" ]] || continue
-        any=1
-        v=$(cat "$rxfile")
-        if [[ "$v" == "0" || -z "$v" ]]; then
-          ok=0
-        fi
-      done
-      for txfile in /sys/class/net/"$dev"/queues/tx-*/xps_cpus; do
-        [[ -f "$txfile" ]] || continue
-        any=1
-        v=$(cat "$txfile")
-        if [[ "$v" == "0" || -z "$v" ]]; then
-          ok=0
-        fi
-      done
-      if (( any == 1 )); then
-        record $ok "RPS/XPS 非零掩码：$dev"
-      fi
-    fi
-  done
-}
-
-check_ulimit_nofile() {
-  local cur
-  cur=$(ulimit -n 2>/dev/null || echo 0)
-  if [[ "$cur" =~ ^[0-9]+$ ]] && (( cur >= 1048576 )); then
-    record 1 "当前会话 nofile >= 1048576（$cur）"
-  else
-    record 0 "当前会话 nofile 不足（$cur），需重启后新会话继承 systemd 限额"
+    fail "$key 应 >= $min（当前 ${got:-<empty>}）"
   fi
 }
 
 selftest_all() {
+  check_supported_os
+  refresh_bbr_support
+  calculate_profile
+
   PASS_CNT=0
+  WARN_CNT=0
   FAIL_CNT=0
 
-  # 再次检测 BBR 状态，以确保自检逻辑与当前内核真实状态一致
-  detect_bbr
+  echo "===== ${SCRIPT_NAME} v${SCRIPT_VERSION} selftest ====="
 
-  echo "===== ${SCRIPT_NAME} 自检开始 ====="
-  check_file_exists "$SYSCTL_FILE"
-  check_file_exists "$LIMITS_FILE"
-  check_file_exists "$SYSTEMD_DROPIN"
-  check_file_exists "$RPS_SCRIPT"
-  check_file_exists "$RPS_SERVICE"
-  check_service_enabled "$RPS_SERVICE"
+  [[ -f "$SYSCTL_FILE" ]] && pass "存在 $SYSCTL_FILE" || fail "缺少 $SYSCTL_FILE"
+  [[ -f "$LIMITS_FILE" ]] && pass "存在 $LIMITS_FILE" || fail "缺少 $LIMITS_FILE"
+  [[ -f "$RPS_SCRIPT" ]] && pass "存在 $RPS_SCRIPT" || fail "缺少 $RPS_SCRIPT"
 
-  local cc exp_cc
-  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+  if [[ -n "$SELECTED_CC" ]]; then
+    check_eq net.ipv4.tcp_congestion_control "$SELECTED_CC"
+  else
+    fail "内核未提供 BBR/BBR2"
+  fi
 
-  if (( HAVE_BBR == 1 )); then
-    if (( support_bbr2 == 1 )); then
-      exp_cc="bbr2"
-    elif (( support_bbr == 1 )); then
-      exp_cc="bbr"
+  check_eq net.core.default_qdisc fq
+  check_ge net.core.rmem_max "$TCP_MAX"
+  check_ge net.core.wmem_max "$TCP_MAX"
+  check_ge net.core.netdev_max_backlog "$NETDEV_BACKLOG"
+  check_ge net.core.somaxconn "$SOMAXCONN"
+  check_eq net.ipv4.tcp_moderate_rcvbuf 1
+  check_eq net.ipv4.tcp_window_scaling 1
+
+  if (( HAS_SYSTEMD == 1 )); then
+    if systemctl is-enabled "$(basename "$RPS_SERVICE")" >/dev/null 2>&1; then
+      pass "RPS/XPS service 已启用"
     else
-      exp_cc="bbr"
+      fail "RPS/XPS service 未启用"
     fi
   else
-    # 最低要求是 BBR，因此期望值仍然是 BBR；实际不是就 FAIL
-    exp_cc="bbr"
+    softwarn "非 systemd 环境，无法验证持久化 RPS/XPS service"
   fi
 
-  # BBR 核心检查：必须是 bbr/bbr2，否则判定为不满足最低要求
-  check_eq net.ipv4.tcp_congestion_control "$exp_cc"
-  if (( BBR_HARD_FAIL == 1 || HAVE_BBR == 0 )); then
-    record 0 "内核未提供 BBR/BBR2（或无法启用），不满足最低要求，请更换内核或启用 tcp_bbr 模块。"
+  local iface
+  iface="$(detect_iface || true)"
+  if [[ -n "$iface" ]]; then
+    pass "默认网络接口：$iface"
+  else
+    fail "无法找到默认网络接口"
   fi
 
-  check_eq net.core.default_qdisc "fq"
-  check_ge net.core.rmem_max 134217728
-  check_ge net.core.wmem_max 134217728
-  check_ge net.core.netdev_max_backlog 250000
-  check_ge net.core.somaxconn 65535
-  check_eq net.ipv4.tcp_fastopen 3
-  check_eq net.ipv4.tcp_mtu_probing 1
-  check_eq net.ipv4.tcp_slow_start_after_idle 0
-  check_ge net.ipv4.neigh.default.gc_thresh3 16384
+  echo "===== PASS=$PASS_CNT WARN=$WARN_CNT FAIL=$FAIL_CNT ====="
+  (( FAIL_CNT == 0 ))
+}
 
-  check_rps_xps_nonzero
-  check_ulimit_nofile
+# ------------------------------ status/diagnose ------------------------------
+show_qdisc() {
+  local iface="$1"
+  have tc || return 0
+  tc qdisc show dev "$iface" 2>/dev/null || true
+}
 
-  echo "===== 自检结束：PASS=$PASS_CNT, FAIL=$FAIL_CNT ====="
-  if (( FAIL_CNT > 0 )); then
-    warn "存在未通过项。若仅为 nofile，可重启后再次自检；若为 BBR 相关错误，则当前内核不满足你的最低要求。"
-    return 1
-  fi
-  return 0
+show_rps_xps() {
+  local iface="$1" f
+  echo "RPS/XPS:"
+  for f in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
+    [[ -f "$f" ]] || continue
+    printf '  %s=%s\n' "$(basename "$(dirname "$f")")/rps_cpus" "$(cat "$f" 2>/dev/null || true)"
+  done
+  for f in /sys/class/net/"$iface"/queues/tx-*/xps_cpus; do
+    [[ -f "$f" ]] || continue
+    printf '  %s=%s\n' "$(basename "$(dirname "$f")")/xps_cpus" "$(cat "$f" 2>/dev/null || true)"
+  done
 }
 
 status_all() {
-  echo "===== Sysctl 关键项 ====="
-  sysctl net.ipv4.tcp_congestion_control || true
-  sysctl net.core.default_qdisc || true
-  sysctl net.core.rmem_max net.core.wmem_max || true
-  sysctl net.core.netdev_max_backlog || true
-  sysctl net.core.somaxconn || true
-  sysctl net.ipv4.tcp_fastopen || true
-  sysctl vm.swappiness || true
+  check_supported_os
+  refresh_bbr_support
+  calculate_profile
 
-  echo -e "\n===== RPS/XPS 检查 ====="
-  local dev rxq txq
-  for dev in /sys/class/net/*; do
-    dev=$(basename "$dev")
-    [[ "$dev" == "lo" ]] && continue
-    [[ "$dev" == docker* || "$dev" == veth* || "$dev" == br-* || "$dev" == "tailscale0" ]] && continue
-    if [[ -d "/sys/class/net/$dev/queues" ]]; then
-      echo ">> $dev"
-      for rxq in /sys/class/net/"$dev"/queues/rx-*; do
-        [[ -e "$rxq" ]] || continue
-        echo -n "  $(basename "$rxq") rps_cpus="; cat "$rxq/rps_cpus"
-      done
-      for txq in /sys/class/net/"$dev"/queues/tx-*; do
-        [[ -e "$txq" ]] || continue
-        if [[ -f "$txq/xps_cpus" ]]; then
-          echo -n "  $(basename "$txq") xps_cpus="; cat "$txq/xps_cpus"
-        else
-          echo "  $(basename "$txq") xps_cpus=<不支持/不存在>"
-        fi
-      done
-    fi
-  done
+  local iface driver rxq txq
+  iface="$(detect_iface || true)"
+  driver=""
+  rxq=0
+  txq=0
+  if [[ -n "$iface" ]]; then
+    driver="$(iface_driver "$iface" || true)"
+    rxq="$(count_queues "$iface" rx)"
+    txq="$(count_queues "$iface" tx)"
+  fi
 
-  echo -e "\n===== NOFILE 限制（当前会话）====="
-  ulimit -n || true
+  echo "===== ${SCRIPT_NAME} v${SCRIPT_VERSION} status ====="
+  echo "OS:                $OS_PRETTY"
+  echo "Kernel:            $(uname -r)"
+  echo "Virtualization:    $(systemd-detect-virt 2>/dev/null || echo unknown)"
+  echo "CPU:               $(nproc)"
+  echo "Memory profile:    $PROFILE_NAME"
+  echo "TCP max target:    $TCP_MAX"
+  echo "Default interface: ${iface:-<none>}"
+  echo "Driver:            ${driver:-unknown}"
+  echo "RX/TX queues:      $rxq/$txq"
+  echo "BBR available:     bbr=$SUPPORT_BBR bbr2=$SUPPORT_BBR2"
+  echo "Selected CC:       ${SELECTED_CC:-<none>}"
+  echo
+
+  sysctl net.ipv4.tcp_congestion_control 2>/dev/null || true
+  sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null || true
+  sysctl net.core.default_qdisc 2>/dev/null || true
+  sysctl net.core.rmem_max net.core.wmem_max 2>/dev/null || true
+  sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem 2>/dev/null || true
+  sysctl net.core.netdev_max_backlog net.core.somaxconn 2>/dev/null || true
+  sysctl net.ipv4.tcp_moderate_rcvbuf net.ipv4.tcp_window_scaling 2>/dev/null || true
+
+  if [[ -n "$iface" ]]; then
+    echo
+    echo "===== qdisc: $iface ====="
+    show_qdisc "$iface"
+    echo
+    show_rps_xps "$iface"
+  fi
+
+  echo
+  echo "Current shell NOFILE: $(ulimit -n 2>/dev/null || echo unknown)"
+  echo "Baseline: $([[ -r "$BASELINE_STATE" ]] && echo present || echo absent)"
 }
 
-# ========== 诊断与自动调优 ==========
-iface_driver() {
-  local IF
-  IF="$(detect_iface)"
-  [[ -z "${IF:-}" ]] && IF="eth0"
-  if command -v ethtool >/dev/null 2>&1; then
-    ethtool -i "$IF" 2>/dev/null | awk -F': ' '/driver:/{print $2; exit}' || echo "unknown"
+diagnose_all() {
+  local aggressive="${1:-0}"
+  check_supported_os
+  refresh_bbr_support
+  calculate_profile
+
+  local iface driver rxq txq cc qdisc ncpu
+  iface="$(detect_iface || true)"
+  ncpu="$(nproc)"
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+  driver=""
+  rxq=0
+  txq=0
+
+  if [[ -n "$iface" ]]; then
+    driver="$(iface_driver "$iface" || true)"
+    rxq="$(count_queues "$iface" rx)"
+    txq="$(count_queues "$iface" tx)"
+  fi
+
+  echo "===== ${SCRIPT_NAME} v${SCRIPT_VERSION} diagnose (READ-ONLY) ====="
+  echo "OS: $OS_PRETTY"
+  echo "Kernel: $(uname -r)"
+  echo "CPU: $ncpu"
+  echo "Memory profile: $PROFILE_NAME"
+  echo "Interface: ${iface:-<none>} driver=${driver:-unknown} queues RX=$rxq TX=$txq"
+  echo "Congestion control: ${cc:-unknown}"
+  echo "Default qdisc: ${qdisc:-unknown}"
+  echo
+
+  if [[ "$cc" == bbr || "$cc" == bbr2 ]]; then
+    pass "正在使用 $cc"
+  elif [[ -n "$SELECTED_CC" ]]; then
+    softwarn "BBR 可用但当前使用 ${cc:-unknown}；apply 会选择 $SELECTED_CC"
   else
-    echo "unknown"
-  fi
-}
-
-iface_name() {
-  local IF
-  IF="$(detect_iface)"
-  [[ -z "${IF:-}" ]] && IF="eth0"
-  echo "$IF"
-}
-
-driver_in_safe_offload_list() {
-  local d="$1"
-  [[ "$d" == virtio_net || "$d" == ena || "$d" == vmxnet3 || "$d" == hv_netvsc || "$d" == mlx* ]]
-}
-
-iperf3_loopback() {
-  local PORT
-  PORT=$(( 50000 + RANDOM % 10000 ))
-  pkill -f "iperf3 -s -p $PORT" >/dev/null 2>&1 || true
-  (iperf3 -s -p "$PORT" >/dev/null 2>&1 &)
-  sleep 0.5
-  local single multi
-  single=$(iperf3 -c 127.0.0.1 -p "$PORT" -t 3 2>/dev/null | awk '/sender$/ {bps=$(NF-1);unit=$NF; if(unit=="Gbits/sec")v=bps*1000; else if(unit=="Mbits/sec")v=bps; else v=0; s=v} END{printf "%.0f", s+0}')
-  multi=$(iperf3 -c 127.0.0.1 -p "$PORT" -t 3 -P 4 2>/dev/null | awk '/SUM.*sender$/ {bps=$(NF-1);unit=$NF; if(unit=="Gbits/sec")v=bps*1000; else if(unit=="Mbits/sec")v=bps; else v=0; s=v} END{printf "%.0f", s+0}')
-  pkill -f "iperf3 -s -p $PORT" >/dev/null 2>&1 || true
-  echo "${single:-0} ${multi:-0}"
-}
-
-persist_ethtool_off() {
-  local IF="$1"
-  cat >"$ETHTOOL_SERVICE" <<EOF
-[Unit]
-Description=Persist ethtool offloads for ${SCRIPT_NAME}
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/sbin/ethtool -K ${IF} gro off gso off tso off
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable --now "$(basename "$ETHTOOL_SERVICE")" || true
-  log "已持久化关闭 ${IF} 的 GRO/GSO/TSO：$(basename "$ETHTOOL_SERVICE")"
-}
-
-auto_fix_safe() {
-  sysctl --system >/dev/null || true
-  systemctl daemon-reload || true
-  systemctl enable --now "$(basename "$RPS_SERVICE")" || true
-  bash "$RPS_SCRIPT" || true
-}
-
-diagnose_core() {
-  need_root
-  ensure_packages
-
-  echo "===== ${SCRIPT_NAME} 诊断开始 ====="
-  local KERN CPUS IFACE DRV QDISC CC
-  KERN="$(uname -r)"
-  CPUS="$(nproc)"
-  IFACE="$(iface_name)"
-  DRV="$(iface_driver)"
-  QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")"
-  CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")"
-
-  echo "内核：$KERN"
-  echo "CPU 核心：$CPUS"
-  echo "网卡：$IFACE（驱动：$DRV）"
-  echo "qdisc：$QDISC, 拥塞算法：$CC"
-
-  local L1 L4
-  read L1 L4 < <(iperf3_loopback)
-  echo "loopback 基准：单流 ${L1} Mbit/s，4 流 ${L4} Mbit/s"
-
-  local NEED_FIX=0
-  if [[ "$QDISC" != "fq" ]]; then
-    echo "建议：将 default_qdisc 设为 fq（当前 $QDISC）。已在配置中指定，将立即修正。"
-    NEED_FIX=1
+    fail "当前内核未提供 BBR/BBR2"
   fi
 
-  local avail EXP_CC
-  detect_bbr
-  avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
-  EXP_CC="bbr"
-  if (( HAVE_BBR == 1 )); then
-    if (( support_bbr2 == 1 )); then
-      EXP_CC="bbr2"
-    elif (( support_bbr == 1 )); then
-      EXP_CC="bbr"
-    fi
-  fi
-
-  if [[ "$CC" != "$EXP_CC" ]]; then
-    echo "建议：将拥塞控制设置为 $EXP_CC（当前 $CC）。已在配置中指定，将立即修正。"
-    NEED_FIX=1
-  fi
-
-  local ANY_ZERO=0 f
-  for f in /sys/class/net/"$IFACE"/queues/rx-*/rps_cpus /sys/class/net/"$IFACE"/queues/tx-*/xps_cpus; do
-    [[ -f "$f" ]] || continue
-    [[ "$(cat "$f")" == "0" ]] && ANY_ZERO=1
-  done
-  if (( ANY_ZERO == 1 )); then
-    echo "建议：为 $IFACE 开启 RPS/XPS 并分布到所有 CPU。将立即修正。"
-    NEED_FIX=1
-  fi
-
-  if (( NEED_FIX == 1 )); then
-    auto_fix_safe
-    echo "已应用上述安全修复。"
+  if [[ "$qdisc" == fq ]]; then
+    pass "default_qdisc=fq"
   else
-    echo "安全修复：不需要。"
+    softwarn "default_qdisc=${qdisc:-unknown}；BBR profile 推荐 fq"
   fi
 
-  local AGGRESSIVE_SUGGEST=0
-  local REASON=""
-  if ! driver_in_safe_offload_list "$DRV"; then
-    if (( L1 < 2500 || L4 < 6000 )); then
-      AGGRESSIVE_SUGGEST=1
-      REASON="检测到驱动非主流虚拟化栈且 loopback 吞吐偏低，可能受 GRO/GSO/TSO 影响。"
-    fi
-  fi
+  local moderate scaling rmax wmax
+  moderate="$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null || true)"
+  scaling="$(sysctl -n net.ipv4.tcp_window_scaling 2>/dev/null || true)"
+  rmax="$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)"
+  wmax="$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)"
 
-  echo "===== 诊断建议汇总 ====="
-  echo "- qdisc 建议：fq（已由脚本管理）"
-  echo "- 拥塞算法建议：$EXP_CC（已由脚本管理，且 BBR 为最低要求）"
-  echo "- RPS/XPS：所有队列掩码非 0（脚本已自动纠正）"
-  if (( AGGRESSIVE_SUGGEST == 1 )); then
-    echo "- 进取建议：$REASON 建议关闭 ${IFACE} 的 GRO/GSO/TSO 并持久化。"
+  [[ "$moderate" == 1 ]] && pass "TCP receive autotuning 已启用" || softwarn "tcp_moderate_rcvbuf=$moderate"
+  [[ "$scaling" == 1 ]] && pass "TCP window scaling 已启用" || fail "tcp_window_scaling=$scaling"
+
+  if [[ "$rmax" =~ ^[0-9]+$ && "$wmax" =~ ^[0-9]+$ ]] && (( rmax >= TCP_MAX && wmax >= TCP_MAX )); then
+    pass "socket buffer 上限满足当前内存 profile"
   else
-    echo "- 进取建议：无需调整 offload（或驱动属于安全白名单）。"
+    softwarn "socket buffer 上限低于本工具 profile（target=$TCP_MAX）"
   fi
 
-  echo "AGGRESSIVE_SUGGEST=$AGGRESSIVE_SUGGEST"
-}
+  if [[ -n "$iface" ]]; then
+    echo
+    echo "----- Actual qdisc -----"
+    show_qdisc "$iface"
 
-diagnose_safe() {
-  local out
-  out="$(diagnose_core)"
-  echo "$out"
-  selftest_all || true
-}
+    echo
+    show_rps_xps "$iface"
 
-diagnose_aggressive() {
-  local out
-  out="$(diagnose_core)"
-  echo "$out"
-  local IFACE flag
-  IFACE="$(iface_name)"
-  flag=$(echo "$out" | awk -F'=' '/AGGRESSIVE_SUGGEST=/{print $2; exit}')
-  if [[ "$flag" == "1" ]]; then
-    if command -v ethtool >/dev/null 2>&1; then
-      /sbin/ethtool -K "$IFACE" gro off gso off tso off || true
-      persist_ethtool_off "$IFACE"
-      echo "已按进取模式应用 offload 关闭，并写入持久化服务：$ETHTOOL_SERVICE"
+    if (( ncpu <= 1 )); then
+      pass "单 vCPU：无需 RPS/XPS"
+    elif (( rxq >= ncpu )); then
+      info "RPS policy: RX queues($rxq) >= CPUs($ncpu)，RSS/multiqueue 通常已足够，V2 会关闭额外 RPS。"
+    elif (( rxq > 0 )); then
+      info "RPS policy: RX queues($rxq) < CPUs($ncpu)，V2 会按 queue 分组 CPU。"
     fi
-  else
-    echo "进取模式：无需要额外更改。"
-  fi
-  selftest_all || true
-}
 
-rollback_all() {
-  need_root
-  warn "将移除本脚本写入的配置并重载系统。"
-  [[ -f "$SYSCTL_FILE" ]] && rm -f "$SYSCTL_FILE"
-  [[ -f "$LIMITS_FILE" ]] && rm -f "$LIMITS_FILE"
-  [[ -f "$SYSTEMD_DROPIN" ]] && rm -f "$SYSTEMD_DROPIN"
-  if systemctl is-enabled "$(basename "$RPS_SERVICE")" &>/dev/null; then
-    systemctl disable --now "$(basename "$RPS_SERVICE")" || true
-  fi
-  [[ -f "$RPS_SERVICE" ]] && rm -f "$RPS_SERVICE"
-  [[ -f "$RPS_SCRIPT"  ]] && rm -f "$RPS_SCRIPT"
-
-  if [[ -f "$ETHTOOL_SERVICE" ]]; then
-    if systemctl is-enabled "$(basename "$ETHTOOL_SERVICE")" &>/dev/null; then
-      systemctl disable --now "$(basename "$ETHTOOL_SERVICE")" || true
+    if (( txq <= 1 )); then
+      info "XPS policy: 单 TX queue，无 queue 选择空间，V2 不启用 XPS。"
+    else
+      info "XPS policy: 多 TX queue，V2 会按 queue 分组 CPU。"
     fi
-    rm -f "$ETHTOOL_SERVICE"
+
+    echo
+    echo "----- NIC counters -----"
+    local rxerr txerr rxdrop txdrop
+    rxerr="$(cat "/sys/class/net/$iface/statistics/rx_errors" 2>/dev/null || echo 0)"
+    txerr="$(cat "/sys/class/net/$iface/statistics/tx_errors" 2>/dev/null || echo 0)"
+    rxdrop="$(cat "/sys/class/net/$iface/statistics/rx_dropped" 2>/dev/null || echo 0)"
+    txdrop="$(cat "/sys/class/net/$iface/statistics/tx_dropped" 2>/dev/null || echo 0)"
+    echo "RX errors=$rxerr dropped=$rxdrop"
+    echo "TX errors=$txerr dropped=$txdrop"
   fi
 
-  sysctl --system >/dev/null || true
-  systemctl daemon-reload || true
-  log "回滚完成。建议重启：reboot"
+  if (( aggressive == 1 )) && [[ -n "$iface" ]]; then
+    echo
+    echo "===== aggressive diagnostics (still READ-ONLY) ====="
+    if have ethtool; then
+      echo "----- Offload state -----"
+      ethtool -k "$iface" 2>/dev/null | grep -E '^(rx-checksumming|tx-checksumming|tcp-segmentation-offload|generic-segmentation-offload|generic-receive-offload|large-receive-offload):' || true
+    else
+      softwarn "ethtool 未安装，无法查看 offload。"
+    fi
+
+    echo
+    echo "----- softnet_stat (raw; per CPU) -----"
+    if [[ -r /proc/net/softnet_stat ]]; then
+      cat /proc/net/softnet_stat
+    fi
+
+    echo
+    info "aggressive 模式不会自动关闭 GRO/GSO/TSO。offload 是否应调整必须用真实远端流量做 A/B test。"
+  fi
+
+  echo
+  echo "诊断完成：未修改任何 sysctl、service、qdisc 或 NIC offload。"
 }
 
-purge_all() {
-  rollback_all
-  [[ -d "$BACKUP_DIR" ]] && rm -rf "$BACKUP_DIR"
-  log "已清理备份目录：$BACKUP_DIR"
-}
-
+# ------------------------------ apply/repair ------------------------------
 apply_all() {
-  need_root
+  need_root "apply"
+  check_supported_os
   ensure_packages
+  load_os_info
+
+  # Hard preflight: do not create baseline or alter anything if BBR is unavailable.
+  require_bbr
+  calculate_profile
+
+  local iface
+  iface="$(detect_iface || true)"
+  [[ -n "$iface" ]] || die "无法检测默认网络接口。"
+
+  log "目标系统：$OS_PRETTY"
+  log "内核：$(uname -r)"
+  log "默认接口：$iface"
+  log "选择拥塞控制：$SELECTED_CC"
+  log "自适应 profile：$PROFILE_NAME"
+
   mkdir -p "$BACKUP_DIR"
-  backup_once
+  backup_baseline_once
+
+  # Remove legacy v1 behavior that persisted GRO/GSO/TSO=off.
+  remove_legacy_offload_service
+
   write_sysctl
   write_limits
   write_rps_script
   write_rps_service
 
-  local cc
-  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
-  log "当前拥塞控制算法：${cc:-<未知>}"
-  log "apply 完成。将自动执行自检..."
-  if selftest_all; then
-    log "自检通过。"
-  else
-    if (( BBR_HARD_FAIL == 1 || HAVE_BBR == 0 )); then
-      err "自检未通过：当前内核未满足最低要求 BBR/BBR2。请更换内核或启用 tcp_bbr 模块。"
-    else
-      warn "自检存在未通过项，详见上方输出。"
-    fi
+  if (( HAS_SYSTEMD == 1 )); then
+    systemctl daemon-reload
   fi
-  log "建议重启以使 systemd 限额完全生效：reboot"
+
+  echo
+  if selftest_all; then
+    log "apply 完成，自检通过。"
+  else
+    warn "apply 已完成，但 selftest 存在失败项；请根据上方结果检查。"
+  fi
+
+  echo
+  info "建议重启一次，使 systemd manager 默认 NOFILE 以及驱动默认 offload 状态完整重新继承。"
 }
 
+repair_all() {
+  need_root "repair"
+  log "repair 将重新生成并应用 V2 管理的配置，不会覆盖第一次 V2 apply 保存的 baseline。"
+  apply_all
+}
+
+# ------------------------------ rollback/purge ------------------------------
+rollback_all() {
+  need_root "rollback"
+  load_os_info
+  [[ -r "$BASELINE_STATE" ]] || die "没有 V2 baseline。为了避免伪回滚，本工具拒绝仅删除配置。"
+
+  warn "正在恢复第一次 V2 apply 前保存的 baseline。"
+
+  if (( HAS_SYSTEMD == 1 )); then
+    systemctl disable --now "$(basename "$RPS_SERVICE")" >/dev/null 2>&1 || true
+    systemctl disable --now "$(basename "$LEGACY_ETHTOOL_SERVICE")" >/dev/null 2>&1 || true
+  fi
+
+  restore_baseline_files
+  restore_runtime_sysctl
+  restore_runtime_rps_xps
+  restore_service_state
+
+  log "baseline 文件、runtime sysctl、RPS/XPS 与 systemd service 状态已恢复。"
+  info "建议重启一次，确保 systemd manager limits 与 NIC runtime 状态完全回到 baseline 环境。"
+}
+
+purge_all() {
+  need_root "purge"
+  rollback_all
+  rm -rf "$BACKUP_DIR"
+  log "已删除备份目录：$BACKUP_DIR"
+  info "主脚本本身未自动删除；如需删除：rm -f /usr/local/sbin/${SCRIPT_NAME}.sh"
+}
+
+# ------------------------------ usage ------------------------------
 usage() {
-  cat <<EOF
-用法：$0 {apply|status|selftest|diagnose|diagnose aggressive|rollback|purge}
+  cat <<USAGE_EOF
+${SCRIPT_NAME} v${SCRIPT_VERSION}
 
-  apply                 应用/更新优化（完成后自动自检，要求至少 BBR）
-  status                查看关键状态（sysctl/RPS/NOFILE）
-  selftest              手动运行自检（若未满足 BBR 最低要求则退出码非 0）
-  diagnose              诊断并输出建议，自动应用“安全修复”
-  diagnose aggressive   诊断并应用“进取修复”（可能关闭 GRO/GSO/TSO），可回滚
-  rollback              回滚本脚本写入的所有配置与服务
-  purge                 回滚并删除备份目录
+Usage:
+  $0 apply
+  $0 repair
+  $0 status
+  $0 selftest
+  $0 diagnose
+  $0 diagnose aggressive
+  $0 "diagnose aggressive"
+  $0 rollback
+  $0 purge
 
-备注：
-- 最低要求为 BBR/BBR2；若内核未提供，将在自检中明确 FAIL，并提醒更换内核或启用 tcp_bbr。
-- 自检若仅报 nofile，不影响网络性能；重启后新会话会继承提升的限额。
-- 进取模式仅在驱动非 virtio_net/ena/vmxnet3/mlx*/hv_netvsc 且 loopback 明显偏低时才会动 offload。
-EOF
+Commands:
+  apply                 自适应应用网络优化。BBR/BBR2 是硬要求；无 BBR 时零修改退出。
+  repair                重新生成/应用 V2 管理的配置，不覆盖第一次 V2 baseline。
+  status                只读：显示当前核心状态。
+  selftest              只读：验证 V2 目标是否真正生效。
+  diagnose              只读：常规诊断，不自动修复。
+  diagnose aggressive   只读：增加 offload/softnet 等深度信息；仍不会关闭 GRO/GSO/TSO。
+  rollback              真正恢复第一次 V2 apply 前的 baseline，而不是简单删除文件。
+  purge                 rollback 后删除 V2 baseline/backup。
+
+Design:
+  - 主要支持 Ubuntu/Debian。
+  - apply 选择 bbr2（若内核提供），否则 bbr；没有 BBR 就中止。
+  - default qdisc 使用 fq。
+  - TCP buffer/backlog 根据 RAM 自适应，不再所有 VPS 固定 128 MiB/250000。
+  - 不修改 tcp_tw_reuse、route.gc_timeout、neighbor GC 阈值、全局 nproc。
+  - RPS/XPS 根据 CPU 与 RX/TX queue 数量自适应。
+  - 不会基于 loopback iperf 猜测 NIC offload，更不会自动关闭 GRO/GSO/TSO。
+USAGE_EOF
 }
 
-case "${1:-}" in
-  apply)                  apply_all ;;
-  status)                 status_all ;;
-  selftest)               selftest_all ;;
-  diagnose)               diagnose_safe ;;
-  "diagnose aggressive")  diagnose_aggressive ;;
-  rollback)               rollback_all ;;
-  purge)                  purge_all ;;
-  *)                      usage; exit 1 ;;
-esac
+# ------------------------------ main ------------------------------
+main() {
+  load_os_info
+
+  case "${1:-}" in
+    apply)
+      apply_all
+      ;;
+    repair)
+      repair_all
+      ;;
+    status)
+      status_all
+      ;;
+    selftest)
+      selftest_all
+      ;;
+    diagnose)
+      if [[ "${2:-}" == "aggressive" ]]; then
+        diagnose_all 1
+      else
+        diagnose_all 0
+      fi
+      ;;
+    "diagnose aggressive")
+      diagnose_all 1
+      ;;
+    rollback)
+      rollback_all
+      ;;
+    purge)
+      purge_all
+      ;;
+    -h|--help|help|"")
+      usage
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
